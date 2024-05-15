@@ -129,6 +129,11 @@ pub struct LaunchDarklyTransformConfig {
     #[configurable(metadata(docs::examples = "sdk-key-123abc"))]
     pub sdk_key: String,
 
+    /// Whether to run the client in offline mode
+    #[configurable(metadata(docs::examples = "true", docs::examples = "false"))]
+    #[serde(default)]
+    pub offline: bool,
+
     /// A list of feature flags to evaluate as defined in Launch Darkly
     #[serde(default = "default_flags")]
     pub flags: Vec<FeatureFlagConfig>,
@@ -145,13 +150,13 @@ impl TransformConfig for LaunchDarklyTransformConfig {
         let ld_client = Client::build(ConfigBuilder::new(&self.sdk_key)
             .service_endpoints(ServiceEndpointsBuilder::new()
                 .relay_proxy(&self.relay_proxy)
-            ).build()?
+            ).offline(self.offline).build()?
         )?;
 
-        // ld_client.start_with_default_executor();
-        // if !ld_client.initialized_async().await {
-        //     panic!("Client failed to successfully initialize");
-        // }
+        ld_client.start_with_default_executor();
+        if !ld_client.initialized_async().await {
+            panic!("Client failed to successfully initialize");
+        }
 
         Ok(Transform::event_task(LaunchDarklyTransform { config: self.clone(), ld_client }))
     }
@@ -209,12 +214,10 @@ impl TaskTransform<Event> for LaunchDarklyTransform {
     }
 }
 
-
 #[test]
 fn generate_config() {
     crate::test_util::test_generate_config::<LaunchDarklyTransformConfig>();
 }
-
 
 #[tokio::test]
 async fn enrich_log() {
@@ -222,6 +225,7 @@ async fn enrich_log() {
         let transform_config = LaunchDarklyTransformConfig {
             relay_proxy: "".to_string(),
             sdk_key: "sdk-key-123abc".to_string(),
+            offline: true,
             flags: vec![FeatureFlagConfig {
                 name: "my-feature-flag".to_string(),
                 kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig {
