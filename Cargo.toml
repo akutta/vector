@@ -352,6 +352,7 @@ heim = { git = "https://github.com/vectordotdev/heim.git", branch = "update-nix"
 
 # make sure to update the external docs when the Lua version changes
 mlua = { version = "0.9.7", default-features = false, features = ["lua54", "send", "vendored", "macros"], optional = true }
+launchdarkly-server-sdk = "2.1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7.0"
@@ -606,6 +607,7 @@ transforms-logs = [
   "transforms-aws_ec2_metadata",
   "transforms-dedupe",
   "transforms-filter",
+  "transforms-launch_darkly",
   "transforms-log_to_metric",
   "transforms-lua",
   "transforms-metric_to_log",
@@ -619,6 +621,7 @@ transforms-logs = [
 transforms-metrics = [
   "transforms-aggregate",
   "transforms-filter",
+  "transforms-launch_darkly",
   "transforms-log_to_metric",
   "transforms-lua",
   "transforms-metric_to_log",
@@ -632,6 +635,7 @@ transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
 transforms-dedupe = ["transforms-impl-dedupe"]
 transforms-filter = []
+transforms-launch_darkly = []
 transforms-log_to_metric = []
 transforms-lua = ["dep:mlua", "vector-lib/lua"]
 transforms-metric_to_log = []
