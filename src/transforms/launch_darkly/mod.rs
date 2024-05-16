@@ -1,11 +1,14 @@
 use std::{future::ready, pin::Pin};
 use futures::{Stream, StreamExt};
 use launchdarkly_server_sdk::{Client, ConfigBuilder, ServiceEndpointsBuilder};
+use ordered_float::NotNan;
 use serde_with::serde_as;
 
 use vector_lib::config::{clone_input_definitions, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::enrichment::TableRegistry;
+
+use vrl::value::Value;
 
 use crate::{config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput}, event::{Event}, transforms::{TaskTransform, Transform}};
 use crate::schema::Definition;
@@ -176,14 +179,14 @@ impl LaunchDarklyTransform {
         match event {
             Event::Log(ref mut log) => {
                 self.config.flags.iter().for_each(|flag| {
-                    // let value = match &flag.kind {
-                    //     LaunchDarklyFlagTypeConfig::Bool(config) => config.default.to_string(),
-                    //     LaunchDarklyFlagTypeConfig::Int(config) => config.default.to_string(),
-                    //     LaunchDarklyFlagTypeConfig::Float(config) => config.default.to_string(),
-                    //     LaunchDarklyFlagTypeConfig::String(config) => config.default.clone(),
-                    //     LaunchDarklyFlagTypeConfig::Json(config) => config.default.clone(),
-                    // };
-                    log.insert(format!("\"{}\"", &flag.result_key).as_str(), String::from("ld_value"));
+                    let value = match &flag.kind {
+                        LaunchDarklyFlagTypeConfig::Bool(config) => Value::Boolean(config.clone().default.into()),
+                        LaunchDarklyFlagTypeConfig::Int(config) => Value::Integer(config.clone().default.into()),
+                        LaunchDarklyFlagTypeConfig::Float(config) => Value::Float(NotNan::new(config.default).expect("value cannot be NaN").into()),
+                        LaunchDarklyFlagTypeConfig::String(config) => Value::Bytes(config.clone().default.into()),
+                        LaunchDarklyFlagTypeConfig::Json(config) => Value::Bytes(config.clone().default.into()),
+                    };
+                    log.insert(format!("\"{}\"", &flag.result_key).as_str(), value);
                 });
             }
             Event::Metric(ref mut metric) => {
@@ -219,7 +222,8 @@ mod tests {
 
     use crate::event::LogEvent;
     use crate::test_util::components::assert_transform_compliance;
-    use crate::transforms::launch_darkly::{BoolConfig, FeatureFlagConfig, LaunchDarklyFlagTypeConfig, LaunchDarklyTransformConfig};
+    use crate::transforms::launch_darkly::{IntConfig, BoolConfig, FloatConfig, StringConfig, JsonConfig};
+    use crate::transforms::launch_darkly::{FeatureFlagConfig, LaunchDarklyFlagTypeConfig, LaunchDarklyTransformConfig};
     use crate::transforms::test::create_topology;
 
     #[test]
@@ -235,12 +239,44 @@ mod tests {
                 sdk_key: "sdk-fake-key".to_string(),
                 offline: true,
                 flags: vec![FeatureFlagConfig {
-                    name: "my-feature-flag".to_string(),
+                    name: "my-feature-flag-1".to_string(),
                     kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig {
                         default: false
                     }),
                     key: "service".to_string(),
-                    result_key: "evaluation".to_string(),
+                    result_key: "evaluation-1".to_string(),
+                    context_fields: None,
+                },FeatureFlagConfig {
+                    name: "my-feature-flag-2".to_string(),
+                    kind: LaunchDarklyFlagTypeConfig::Int(IntConfig {
+                        default: 123
+                    }),
+                    key: "service".to_string(),
+                    result_key: "evaluation-2".to_string(),
+                    context_fields: None,
+                },FeatureFlagConfig {
+                    name: "my-feature-flag-3".to_string(),
+                    kind: LaunchDarklyFlagTypeConfig::Float(FloatConfig {
+                        default: 123.1234
+                    }),
+                    key: "service".to_string(),
+                    result_key: "evaluation-3".to_string(),
+                    context_fields: None,
+                },FeatureFlagConfig {
+                    name: "my-feature-flag-4".to_string(),
+                    kind: LaunchDarklyFlagTypeConfig::String(StringConfig {
+                        default: "special value".to_string()
+                    }),
+                    key: "service".to_string(),
+                    result_key: "evaluation-4".to_string(),
+                    context_fields: None,
+                },FeatureFlagConfig {
+                    name: "my-feature-flag-5".to_string(),
+                    kind: LaunchDarklyFlagTypeConfig::Json(JsonConfig {
+                        default: "{ \"key\": \"value\" }".to_string()
+                    }),
+                    key: "service".to_string(),
+                    result_key: "evaluation-5".to_string(),
                     context_fields: None,
                 }],
             };
@@ -256,7 +292,19 @@ mod tests {
             let mut expected_log = log.clone();
             expected_log.insert(
                 format!("\"{}\"", &transform_config.flags[0].result_key).as_str(),
-                "ld_value");
+                false);
+            expected_log.insert(
+                format!("\"{}\"", &transform_config.flags[1].result_key).as_str(),
+                123);
+            expected_log.insert(
+                format!("\"{}\"", &transform_config.flags[2].result_key).as_str(),
+                123.1234);
+            expected_log.insert(
+                format!("\"{}\"", &transform_config.flags[3].result_key).as_str(),
+                "special value");
+            expected_log.insert(
+                format!("\"{}\"", &transform_config.flags[4].result_key).as_str(),
+                "{ \"key\": \"value\" }");
 
             tx.send(log.into()).await.unwrap();
 
