@@ -1,19 +1,14 @@
 use std::{future::ready, pin::Pin};
-use std::time::Duration;
 use futures::{Stream, StreamExt};
+use launchdarkly_server_sdk::{Client, ConfigBuilder, ServiceEndpointsBuilder};
 use serde_with::serde_as;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
-use tokio_stream::wrappers::ReceiverStream;
+
+use vector_lib::config::{clone_input_definitions, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::enrichment::TableRegistry;
-use vector_lib::config::{clone_input_definitions, LogNamespace};
-use launchdarkly_server_sdk::{Client, ConfigBuilder,  ServiceEndpointsBuilder};
 
-use crate::{config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput}, event::{Event, LogEvent}, transforms::{TaskTransform, Transform}};
+use crate::{config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput}, event::{Event}, transforms::{TaskTransform, Transform}};
 use crate::schema::Definition;
-use crate::test_util::components::assert_transform_compliance;
-use crate::transforms::test::create_topology;
 
 impl_generate_config_from_default!(LaunchDarklyTransformConfig);
 
@@ -214,50 +209,64 @@ impl TaskTransform<Event> for LaunchDarklyTransform {
     }
 }
 
-#[test]
-fn generate_config() {
-    crate::test_util::test_generate_config::<LaunchDarklyTransformConfig>();
-}
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-#[tokio::test]
-async fn enrich_log() {
-    assert_transform_compliance(async {
-        let transform_config = LaunchDarklyTransformConfig {
-            relay_proxy: "".to_string(),
-            sdk_key: "sdk-key-123abc".to_string(),
-            offline: true,
-            flags: vec![FeatureFlagConfig {
-                name: "my-feature-flag".to_string(),
-                kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig {
-                    default: false
-                }),
-                key: "service".to_string(),
-                result_key: "evaluation".to_string(),
-                context_fields: None,
-            }],
-        };
+    use tokio::sync::mpsc;
+    use tokio::time::sleep;
+    use tokio_stream::wrappers::ReceiverStream;
 
-        let (tx, rx) = mpsc::channel(1);
-        let (topology, mut out) =
-            create_topology(ReceiverStream::new(rx), transform_config.clone()).await;
+    use crate::event::LogEvent;
+    use crate::test_util::components::assert_transform_compliance;
+    use crate::transforms::launch_darkly::{BoolConfig, FeatureFlagConfig, LaunchDarklyFlagTypeConfig, LaunchDarklyTransformConfig};
+    use crate::transforms::test::create_topology;
 
-        // We need to sleep to let the background task fetch the data.
-        sleep(Duration::from_secs(1)).await;
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<LaunchDarklyTransformConfig>();
+    }
 
-        let log = LogEvent::default();
-        let mut expected_log = log.clone();
-        expected_log.insert(
-            format!("\"{}\"", &transform_config.flags[0].result_key).as_str(),
-            "ld_value");
+    #[tokio::test]
+    async fn enrich_log() {
+        assert_transform_compliance(async {
+            let transform_config = LaunchDarklyTransformConfig {
+                relay_proxy: "".to_string(),
+                sdk_key: "sdk-fake-key".to_string(),
+                offline: true,
+                flags: vec![FeatureFlagConfig {
+                    name: "my-feature-flag".to_string(),
+                    kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig {
+                        default: false
+                    }),
+                    key: "service".to_string(),
+                    result_key: "evaluation".to_string(),
+                    context_fields: None,
+                }],
+            };
 
-        tx.send(log.into()).await.unwrap();
+            let (tx, rx) = mpsc::channel(1);
+            let (topology, mut out) =
+                create_topology(ReceiverStream::new(rx), transform_config.clone()).await;
 
-        let event = out.recv().await.unwrap();
-        assert_event_data_eq!(event.into_log(), expected_log);
+            // We need to sleep to let the background task fetch the data.
+            sleep(Duration::from_secs(1)).await;
 
-        drop(tx);
-        topology.stop().await;
-        assert_eq!(out.recv().await, None);
-    })
-        .await;
+            let log = LogEvent::default();
+            let mut expected_log = log.clone();
+            expected_log.insert(
+                format!("\"{}\"", &transform_config.flags[0].result_key).as_str(),
+                "ld_value");
+
+            tx.send(log.into()).await.unwrap();
+
+            let event = out.recv().await.unwrap();
+            assert_event_data_eq!(event.into_log(), expected_log);
+
+            drop(tx);
+            topology.stop().await;
+            assert_eq!(out.recv().await, None);
+        })
+            .await;
+    }
 }
