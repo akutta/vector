@@ -83,7 +83,7 @@ pub enum LaunchDarklyFlagTypeConfig {
 /// The type of event to evaluate flags for
 #[configurable_component]
 #[derive(Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 #[configurable(metadata(docs::enum_tag_description = "The type of event to evaluate the feature flag for"))]
 pub enum LaunchDarklyEnrichType {
     /// A metric.
@@ -213,7 +213,6 @@ impl TransformConfig for LaunchDarklyTransformConfig {
         let mut log_flags : Vec<FeatureFlagConfig> = vec![];
         let mut metric_flags : Vec<FeatureFlagConfig> = vec![];
         for flag in &self.flags {
-            error!("flag: {:?} - {:?}", flag.name, flag.event_kind);
             for event_kind in &flag.event_kind {
                 match event_kind {
                     LaunchDarklyEnrichType::Metric => {
@@ -226,8 +225,6 @@ impl TransformConfig for LaunchDarklyTransformConfig {
             }
         }
 
-        error!("log_flags: {:?}", log_flags);
-        error!("metric_flags: {:?}", metric_flags);
 
         Ok(Transform::event_task(LaunchDarklyTransform { ld_client, log_flags: log_flags.to_vec(), metric_flags: metric_flags.to_vec() }))
     }
@@ -257,7 +254,6 @@ impl LaunchDarklyTransform {
         match event {
             Event::Log(ref mut log) => {
                 self.log_flags.iter().for_each(|flag| {
-                    error!("log flag: {:?}", flag);
                     let value = match &flag.kind {
                         LaunchDarklyFlagTypeConfig::Bool(config) => Value::Boolean(config.clone().default.into()),
                         LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.into(),
@@ -297,8 +293,9 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::sleep;
     use tokio_stream::wrappers::ReceiverStream;
+    use vector_lib::event::Event;
 
-    use crate::event::LogEvent;
+    use crate::event::{EventMetadata, LogEvent, Metric, MetricKind, MetricValue};
     use crate::test_util::components::assert_transform_compliance;
     use crate::transforms::launch_darkly::LaunchDarklyTransformConfig;
     use crate::transforms::test::create_topology;
@@ -342,6 +339,11 @@ mod tests {
               type: json
               key: service
               result_key: evaluation-5
+            - name: no-op
+              type: json
+              key: service
+              result_key: evaluation-6
+              event_kind: [metric]
             "#,
         );
 
@@ -375,6 +377,77 @@ mod tests {
 
             let event = out.recv().await.unwrap();
             assert_event_data_eq!(event.into_log(), expected_log);
+
+            drop(tx);
+            topology.stop().await;
+            assert_eq!(out.recv().await, None);
+        })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn enrich_metric() {
+        let transform_config = parse_yaml_config(
+            r#"
+            sdk_key: "sdk-fake-key"
+            offline: true
+            flags:
+            - name: my-feature-flag-1
+              type: bool
+              key: service
+              result_key: evaluation-1
+            - name: my-feature-flag-2
+              type: int
+              default: 123
+              key: service
+              result_key: evaluation-2
+            - name: my-feature-flag-3
+              type: float
+              default: 123.1234
+              key: service
+              result_key: evaluation-3
+            - name: my-feature-flag-4
+              type: string
+              default: special value
+              key: service
+              result_key: evaluation-4
+            - name: my-feature-flag-5
+              type: json
+              key: service
+              result_key: evaluation-5
+            - name: no-op
+              type: json
+              key: service
+              result_key: evaluation-6
+              event_kind: [log]
+            "#,
+        );
+
+        assert_transform_compliance(async {
+            let (tx, rx) = mpsc::channel(1);
+            let (topology, mut out) =
+                create_topology(ReceiverStream::new(rx), transform_config.clone()).await;
+
+            // We need to sleep to let the background task fetch the data.
+            sleep(Duration::from_secs(1)).await;
+
+            let event_metadata = EventMetadata::default().with_source_type("unit_test_stream");
+            let metric = Event::Metric(
+                Metric::new_with_metadata(
+                    "counter",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 1.0 },
+                    event_metadata,
+                )
+            );
+
+            let mut expected_metric = metric.clone().into_metric();
+            expected_metric.replace_tag(String::from("launch_darkly"), String::from("ld_value"));
+
+            tx.send(metric.into()).await.unwrap();
+
+            let event = out.recv().await.unwrap();
+            assert_event_data_eq!(event.into_metric(), expected_metric);
 
             drop(tx);
             topology.stop().await;
