@@ -1,19 +1,17 @@
 use std::{future::ready, pin::Pin};
+
 use futures::{Stream, StreamExt};
 use launchdarkly_server_sdk::{Client, ConfigBuilder, ServiceEndpointsBuilder};
-use ordered_float::NotNan;
 use serde_with::serde_as;
+use vrl::value::Value;
 
 use vector_lib::config::{clone_input_definitions, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::enrichment::TableRegistry;
 
-use vrl::value::Value;
-
-use crate::{config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput}, event::{Event}, transforms::{TaskTransform, Transform}};
+use crate::{config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput}, event::Event, transforms::{TaskTransform, Transform}};
+use crate::config::GenerateConfig;
 use crate::schema::Definition;
-
-impl_generate_config_from_default!(LaunchDarklyTransformConfig);
 
 /// Configuration for Bool Feature Flag
 #[configurable_component]
@@ -82,6 +80,18 @@ pub enum LaunchDarklyFlagTypeConfig {
     Json(JsonConfig),
 }
 
+/// The type of event to evaluate flags for
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[configurable(metadata(docs::enum_tag_description = "The type of event to evaluate the feature flag for"))]
+pub enum LaunchDarklyEnrichType {
+    /// A metric.
+    Metric,
+    /// A log.
+    Log,
+}
+
 /// Specification of a feature flag to evaluate
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -99,6 +109,11 @@ pub struct FeatureFlagConfig {
     #[configurable(metadata(docs::examples = "service"))]
     pub key: String,
 
+    /// The set of event types to evaluate the feature flag for
+    #[configurable(metadata(docs::examples = "metric", docs::examples="log"))]
+    #[serde(default = "default_event_kinds")]
+    pub event_kind: Vec<LaunchDarklyEnrichType>,
+
     /// The fields used as additional metadata for the Launch Darkly feature flag evaluation
     #[configurable(metadata(docs::examples = "region", docks::examples = "environment"))]
     pub context_fields: Option<Vec<String>>,
@@ -106,6 +121,23 @@ pub struct FeatureFlagConfig {
     /// The key used to store the result of the Launch Darkly feature flag evaluation
     #[configurable(metadata(docs::examples = "evaluation"))]
     pub result_key: String,
+}
+
+fn default_event_kinds() -> Vec<LaunchDarklyEnrichType> {
+    vec![LaunchDarklyEnrichType::Log, LaunchDarklyEnrichType::Metric]
+}
+
+impl GenerateConfig for FeatureFlagConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(FeatureFlagConfig {
+            name: "".to_string(),
+            kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig { default: false }),
+            key: "".to_string(),
+            event_kind: vec![LaunchDarklyEnrichType::Log, LaunchDarklyEnrichType::Metric],
+            context_fields: None,
+            result_key: "".to_string(),
+        }).unwrap()
+    }
 }
 
 /// Configuration for the `launch_darkly` transform.
@@ -121,7 +153,7 @@ pub struct LaunchDarklyTransformConfig {
     /// The relay proxy configuration for Launch Darkly
     ///  https://docs.launchdarkly.com/sdk/features/relay-proxy-configuration/proxy-mode#rust
     #[configurable(metadata(docs::examples = "https://your-relay-proxy.com:8030"))]
-    pub relay_proxy: String,
+    pub relay_proxy: Option<String>,
 
     /// The SDK key for Launch Darkly
     #[configurable(metadata(docs::examples = "sdk-key-123abc"))]
@@ -133,30 +165,71 @@ pub struct LaunchDarklyTransformConfig {
     pub offline: bool,
 
     /// A list of feature flags to evaluate as defined in Launch Darkly
-    #[serde(default = "default_flags")]
+    #[configurable(derived)]
+    #[serde(default)]
     pub flags: Vec<FeatureFlagConfig>,
 }
 
-fn default_flags() -> Vec<FeatureFlagConfig> {
-    vec![]
+impl GenerateConfig for LaunchDarklyTransformConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(LaunchDarklyTransformConfig {
+            relay_proxy: None,
+            sdk_key: "".to_string(),
+            offline: false,
+            flags: vec![]
+        }).unwrap()
+    }
 }
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "launch_darkly")]
 impl TransformConfig for LaunchDarklyTransformConfig {
     async fn build(&self, _cx: &TransformContext) -> crate::Result<Transform> {
-        let ld_client = Client::build(ConfigBuilder::new(&self.sdk_key)
-            .service_endpoints(ServiceEndpointsBuilder::new()
-                .relay_proxy(&self.relay_proxy)
-            ).offline(self.offline).build()?
-        )?;
+        let ld_client = match self.relay_proxy {
+            Some(ref relay_proxy) => {
+                if relay_proxy.is_empty() {
+                    return Err("relay_proxy must not be empty".into());
+                }
+                let client = Client::build(ConfigBuilder::new(&self.sdk_key)
+                                  .service_endpoints(ServiceEndpointsBuilder::new()
+                                      .relay_proxy(&relay_proxy)
+                                  ).offline(self.offline).build()?)?;
+                client
+            }
+            None => {
+                let client = Client::build(ConfigBuilder::new(&self.sdk_key)
+                    .offline(self.offline)
+                    .build()?
+                )?;
+                client
+            }
+        };
 
         ld_client.start_with_default_executor();
         if !ld_client.initialized_async().await {
             panic!("Client failed to successfully initialize");
         }
 
-        Ok(Transform::event_task(LaunchDarklyTransform { config: self.clone(), ld_client }))
+        let mut log_flags : Vec<FeatureFlagConfig> = vec![];
+        let mut metric_flags : Vec<FeatureFlagConfig> = vec![];
+        for flag in &self.flags {
+            error!("flag: {:?} - {:?}", flag.name, flag.event_kind);
+            for event_kind in &flag.event_kind {
+                match event_kind {
+                    LaunchDarklyEnrichType::Metric => {
+                        metric_flags.push(flag.clone());
+                    }
+                    LaunchDarklyEnrichType::Log => {
+                        log_flags.push(flag.clone());
+                    }
+                }
+            }
+        }
+
+        error!("log_flags: {:?}", log_flags);
+        error!("metric_flags: {:?}", metric_flags);
+
+        Ok(Transform::event_task(LaunchDarklyTransform { ld_client, log_flags: log_flags.to_vec(), metric_flags: metric_flags.to_vec() }))
     }
 
     fn input(&self) -> Input {
@@ -169,20 +242,26 @@ impl TransformConfig for LaunchDarklyTransformConfig {
 }
 
 pub struct LaunchDarklyTransform {
-    config: LaunchDarklyTransformConfig,
     ld_client: Client,
+    log_flags: Vec<FeatureFlagConfig>,
+    metric_flags: Vec<FeatureFlagConfig>
 }
 
 impl LaunchDarklyTransform {
     fn transform_one(&self, mut event: Event) -> Event {
+        if self.log_flags.is_empty() && self.metric_flags.is_empty() {
+            return event;
+        }
+
         let _ = self.ld_client;
         match event {
             Event::Log(ref mut log) => {
-                self.config.flags.iter().for_each(|flag| {
+                self.log_flags.iter().for_each(|flag| {
+                    error!("log flag: {:?}", flag);
                     let value = match &flag.kind {
                         LaunchDarklyFlagTypeConfig::Bool(config) => Value::Boolean(config.clone().default.into()),
-                        LaunchDarklyFlagTypeConfig::Int(config) => Value::Integer(config.clone().default.into()),
-                        LaunchDarklyFlagTypeConfig::Float(config) => Value::Float(NotNan::new(config.default).expect("value cannot be NaN").into()),
+                        LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.into(),
+                        LaunchDarklyFlagTypeConfig::Float(config) => config.clone().default.into(),
                         LaunchDarklyFlagTypeConfig::String(config) => Value::Bytes(config.clone().default.into()),
                         LaunchDarklyFlagTypeConfig::Json(config) => Value::Bytes(config.clone().default.into()),
                     };
@@ -191,7 +270,6 @@ impl LaunchDarklyTransform {
             }
             Event::Metric(ref mut metric) => {
                 metric.replace_tag(String::from("launch_darkly"), String::from("ld_value"));
-                metric.replace_tag(String::from("launch_darkly_key"), self.config.sdk_key.clone());
             }
             Event::Trace(_) => panic!("Traces are not supported."),
         }
@@ -222,8 +300,7 @@ mod tests {
 
     use crate::event::LogEvent;
     use crate::test_util::components::assert_transform_compliance;
-    use crate::transforms::launch_darkly::{IntConfig, BoolConfig, FloatConfig, StringConfig, JsonConfig};
-    use crate::transforms::launch_darkly::{FeatureFlagConfig, LaunchDarklyFlagTypeConfig, LaunchDarklyTransformConfig};
+    use crate::transforms::launch_darkly::LaunchDarklyTransformConfig;
     use crate::transforms::test::create_topology;
 
     #[test]
@@ -231,56 +308,44 @@ mod tests {
         crate::test_util::test_generate_config::<LaunchDarklyTransformConfig>();
     }
 
+    fn parse_yaml_config(s: &str) -> LaunchDarklyTransformConfig {
+        serde_yaml::from_str(s).unwrap()
+    }
+
     #[tokio::test]
     async fn enrich_log() {
-        assert_transform_compliance(async {
-            let transform_config = LaunchDarklyTransformConfig {
-                relay_proxy: "".to_string(),
-                sdk_key: "sdk-fake-key".to_string(),
-                offline: true,
-                flags: vec![FeatureFlagConfig {
-                    name: "my-feature-flag-1".to_string(),
-                    kind: LaunchDarklyFlagTypeConfig::Bool(BoolConfig {
-                        default: false
-                    }),
-                    key: "service".to_string(),
-                    result_key: "evaluation-1".to_string(),
-                    context_fields: None,
-                },FeatureFlagConfig {
-                    name: "my-feature-flag-2".to_string(),
-                    kind: LaunchDarklyFlagTypeConfig::Int(IntConfig {
-                        default: 123
-                    }),
-                    key: "service".to_string(),
-                    result_key: "evaluation-2".to_string(),
-                    context_fields: None,
-                },FeatureFlagConfig {
-                    name: "my-feature-flag-3".to_string(),
-                    kind: LaunchDarklyFlagTypeConfig::Float(FloatConfig {
-                        default: 123.1234
-                    }),
-                    key: "service".to_string(),
-                    result_key: "evaluation-3".to_string(),
-                    context_fields: None,
-                },FeatureFlagConfig {
-                    name: "my-feature-flag-4".to_string(),
-                    kind: LaunchDarklyFlagTypeConfig::String(StringConfig {
-                        default: "special value".to_string()
-                    }),
-                    key: "service".to_string(),
-                    result_key: "evaluation-4".to_string(),
-                    context_fields: None,
-                },FeatureFlagConfig {
-                    name: "my-feature-flag-5".to_string(),
-                    kind: LaunchDarklyFlagTypeConfig::Json(JsonConfig {
-                        default: "{ \"key\": \"value\" }".to_string()
-                    }),
-                    key: "service".to_string(),
-                    result_key: "evaluation-5".to_string(),
-                    context_fields: None,
-                }],
-            };
+        let transform_config = parse_yaml_config(
+            r#"
+            sdk_key: "sdk-fake-key"
+            offline: true
+            flags:
+            - name: my-feature-flag-1
+              type: bool
+              key: service
+              result_key: evaluation-1
+            - name: my-feature-flag-2
+              type: int
+              default: 123
+              key: service
+              result_key: evaluation-2
+            - name: my-feature-flag-3
+              type: float
+              default: 123.1234
+              key: service
+              result_key: evaluation-3
+            - name: my-feature-flag-4
+              type: string
+              default: special value
+              key: service
+              result_key: evaluation-4
+            - name: my-feature-flag-5
+              type: json
+              key: service
+              result_key: evaluation-5
+            "#,
+        );
 
+        assert_transform_compliance(async {
             let (tx, rx) = mpsc::channel(1);
             let (topology, mut out) =
                 create_topology(ReceiverStream::new(rx), transform_config.clone()).await;
@@ -304,7 +369,7 @@ mod tests {
                 "special value");
             expected_log.insert(
                 format!("\"{}\"", &transform_config.flags[4].result_key).as_str(),
-                "{ \"key\": \"value\" }");
+                "");
 
             tx.send(log.into()).await.unwrap();
 
