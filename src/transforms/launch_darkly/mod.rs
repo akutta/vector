@@ -265,7 +265,18 @@ impl LaunchDarklyTransform {
                 });
             }
             Event::Metric(ref mut metric) => {
-                metric.replace_tag(String::from("launch_darkly"), String::from("ld_value"));
+                self.metric_flags.iter().for_each(|flag| {
+                    let value = match &flag.kind {
+                        LaunchDarklyFlagTypeConfig::Bool(config) => config.clone().default.to_string(),
+                        LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.to_string(),
+                        LaunchDarklyFlagTypeConfig::Float(config) => config.clone().default.to_string(),
+                        LaunchDarklyFlagTypeConfig::String(config) => config.clone().default,
+                        LaunchDarklyFlagTypeConfig::Json(config) => config.clone().default,
+                    };
+                    metric.replace_tag(flag.result_key.to_string(), value);
+                });
+
+
             }
             Event::Trace(_) => panic!("Traces are not supported."),
         }
@@ -442,7 +453,22 @@ mod tests {
             );
 
             let mut expected_metric = metric.clone().into_metric();
-            expected_metric.replace_tag(String::from("launch_darkly"), String::from("ld_value"));
+
+            expected_metric.replace_tag(
+                transform_config.flags[0].result_key.to_string(),
+                "false".to_string());
+            expected_metric.replace_tag(
+                transform_config.flags[1].result_key.to_string(),
+                "123".to_string());
+            expected_metric.replace_tag(
+                transform_config.flags[2].result_key.to_string(),
+                "123.1234".to_string());
+            expected_metric.replace_tag(
+                transform_config.flags[3].result_key.to_string(),
+                "special value".to_string());
+            expected_metric.replace_tag(
+                transform_config.flags[4].result_key.to_string(),
+                "".to_string());
 
             tx.send(metric.into()).await.unwrap();
 
