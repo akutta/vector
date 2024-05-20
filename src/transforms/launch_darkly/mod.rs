@@ -244,6 +244,18 @@ pub struct LaunchDarklyTransform {
     metric_flags: Vec<FeatureFlagConfig>
 }
 
+impl FeatureFlagConfig {
+    fn default_value(&self) -> Value {
+        match &self.kind {
+            LaunchDarklyFlagTypeConfig::Bool(config) => Value::Boolean(config.clone().default.into()),
+            LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.into(),
+            LaunchDarklyFlagTypeConfig::Float(config) => config.clone().default.into(),
+            LaunchDarklyFlagTypeConfig::String(config) => Value::from(config.clone().default),
+            LaunchDarklyFlagTypeConfig::Json(config) => Value::from(config.clone().default),
+        }
+    }
+}
+
 impl LaunchDarklyTransform {
     fn transform_one(&self, mut event: Event) -> Event {
         if self.log_flags.is_empty() && self.metric_flags.is_empty() {
@@ -254,24 +266,15 @@ impl LaunchDarklyTransform {
         match event {
             Event::Log(ref mut log) => {
                 self.log_flags.iter().for_each(|flag| {
-                    let value = match &flag.kind {
-                        LaunchDarklyFlagTypeConfig::Bool(config) => Value::Boolean(config.clone().default.into()),
-                        LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.into(),
-                        LaunchDarklyFlagTypeConfig::Float(config) => config.clone().default.into(),
-                        LaunchDarklyFlagTypeConfig::String(config) => Value::Bytes(config.clone().default.into()),
-                        LaunchDarklyFlagTypeConfig::Json(config) => Value::Bytes(config.clone().default.into()),
-                    };
-                    log.insert(format!("\"{}\"", &flag.result_key).as_str(), value);
+                    log.insert(format!("\"{}\"", &flag.result_key).as_str(), flag.default_value());
                 });
             }
             Event::Metric(ref mut metric) => {
                 self.metric_flags.iter().for_each(|flag| {
-                    let value = match &flag.kind {
-                        LaunchDarklyFlagTypeConfig::Bool(config) => config.clone().default.to_string(),
-                        LaunchDarklyFlagTypeConfig::Int(config) => config.clone().default.to_string(),
-                        LaunchDarklyFlagTypeConfig::Float(config) => config.clone().default.to_string(),
-                        LaunchDarklyFlagTypeConfig::String(config) => config.clone().default,
-                        LaunchDarklyFlagTypeConfig::Json(config) => config.clone().default,
+                    let value = match flag.default_value() {
+                        Value::Boolean(_) | Value::Integer(_) | Value::Float(_) => flag.default_value().to_string(),
+                        Value::Bytes(b) => String::from_utf8_lossy(b.as_ref()).into(),
+                        _ => panic!("Unexpected value type")
                     };
                     metric.replace_tag(flag.result_key.to_string(), value);
                 });
