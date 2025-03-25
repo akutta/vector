@@ -280,6 +280,7 @@ pub struct State {
 
     max_file_age_secs: Option<u64>,
     deferred_queue_url: Option<String>,
+    retry_entries: Vec<SendMessageBatchRequestEntry>,
 }
 
 pub(super) struct Ingestor {
@@ -324,6 +325,8 @@ impl Ingestor {
 
             deferred_queue_url: config.deferred_queue_url,
             max_file_age_secs: config.max_file_age_secs,
+
+            retry_entries: Vec::new(),
         });
 
         Ok(Ingestor { state })
@@ -419,7 +422,8 @@ impl IngestorProcess {
             .unwrap_or_default();
 
         let mut delete_entries = Vec::new();
-        let mut retry_entries = Vec::new();
+        self.state.retry_entries.clear();
+
         for message in messages {
             let receipt_handle = match message.receipt_handle {
                 None => {
@@ -457,50 +461,36 @@ impl IngestorProcess {
                     }
                 }
                 Err(err) => {
-                    match err {
-                        ProcessingError::FileTooOld { .. } => {
-                            emit!(SqsMessageProcessingSucceeded {
-                                message_id: &message_id
-                            });
-                            if let Some(deferred_queue) = &self.state.deferred_queue_url {
-                                trace!(
-                                    message = "Forwarding message to deferred queue.",
-                                    id = message_id,
-                                    receipt_handle = receipt_handle,
-                                    deferred_queue = deferred_queue,
-                                );
+                    emit!(SqsMessageProcessingError {
+                        message_id: &message_id,
+                        error: &err,
+                    });
+                }
+            }
+        }
 
-                                retry_entries.push(
-                                    SendMessageBatchRequestEntry::builder()
-                                        .id(message_id.clone())
-                                        .message_body(message.body.unwrap_or_default())
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
-                            }
-                            //  maybe delete the message from current queue since we have processed it
-                            if self.state.delete_message {
-                                trace!(
-                                    message = "Queued SQS message for deletion.",
-                                    id = message_id,
-                                    receipt_handle = receipt_handle,
-                                );
-                                delete_entries.push(
-                                    DeleteMessageBatchRequestEntry::builder()
-                                        .id(message_id)
-                                        .receipt_handle(receipt_handle)
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
-                            }
-                        }
-                        _ => {
-                            emit!(SqsMessageProcessingError {
-                                message_id: &message_id,
-                                error: &err,
-                            });
-                        }
+        if !self.state.retry_entries.is_empty() {
+            let cloned_entries = self.state.retry_entries.clone();
+            match self.send_messages().await {
+                Ok(result) => {
+                    if !result.successful.is_empty() {
+                        emit!(SqsMessageSentSucceeded {
+                            message_ids: result.successful,
+                        })
                     }
+
+                    if !result.failed.is_empty() {
+                        emit!(SqsMessageSentPartialError {
+                            entries: result.failed
+                        })
+
+                    }
+                }
+                Err(err) => {
+                    emit!(SqsMessageSendBatchError {
+                        entries: cloned_entries,
+                        error: err,
+                    });
                 }
             }
         }
@@ -508,7 +498,7 @@ impl IngestorProcess {
         if !delete_entries.is_empty() {
             // We need these for a correct error message if the batch fails overall.
             let cloned_entries = delete_entries.clone();
-            match self.delete_messages(delete_entries).await {
+            match self.delete_messages().await {
                 Ok(result) => {
                     // Batch deletes can have partial successes/failures, so we have to check
                     // for both cases and emit accordingly.
@@ -532,31 +522,6 @@ impl IngestorProcess {
                 }
             }
         }
-
-        if !retry_entries.is_empty() {
-            let cloned_entries = retry_entries.clone();
-            match self.send_messages(cloned_entries).await {
-                Ok(result) => {
-                    if !result.successful.is_empty() {
-                        emit!(SqsMessageSentSucceeded {
-                            message_ids: result.successful,
-                        })
-                    }
-
-                    if !result.failed.is_empty() {
-                        emit!(SqsMessageSentPartialError {
-                            entries: result.failed
-                        })
-                    }
-                }
-                Err(err) => {
-                    emit!(SqsMessageSendBatchError {
-                        entries: retry_entries,
-                        error: err,
-                    });
-                }
-            }
-        }
     }
 
     async fn handle_sqs_message(&mut self, message: Message) -> Result<(), ProcessingError> {
@@ -564,12 +529,10 @@ impl IngestorProcess {
         let sqs_body = serde_json::from_str::<SnsNotification>(sqs_body.as_ref())
             .map(|notification| notification.message)
             .unwrap_or(sqs_body);
+        let message_id = message.message_id.clone().unwrap_or_else(|| "<empty>".to_owned());
         let s3_event: SqsEvent =
             serde_json::from_str(sqs_body.as_ref()).context(InvalidSqsMessageSnafu {
-                message_id: message
-                    .message_id
-                    .clone()
-                    .unwrap_or_else(|| "<empty>".to_owned()),
+                message_id: message_id.clone(),
             })?;
 
         match s3_event {
@@ -577,13 +540,13 @@ impl IngestorProcess {
                 debug!(?message.message_id, message = "Found S3 Test Event.");
                 Ok(())
             }
-            SqsEvent::Event(s3_event) => self.handle_s3_event(s3_event).await,
+            SqsEvent::Event(s3_event) => self.handle_s3_event(message_id.clone(), s3_event).await,
         }
     }
 
-    async fn handle_s3_event(&mut self, s3_event: S3Event) -> Result<(), ProcessingError> {
+    async fn handle_s3_event(&mut self, message_id: String, s3_event: S3Event) -> Result<(), ProcessingError> {
         for record in s3_event.records {
-            self.handle_s3_event_record(record, self.log_namespace)
+            self.handle_s3_event_record(message_id, record, self.log_namespace)
                 .await?
         }
         Ok(())
@@ -591,6 +554,7 @@ impl IngestorProcess {
 
     async fn handle_s3_event_record(
         &mut self,
+        message_id: String,
         s3_event: S3EventRecord,
         log_namespace: LogNamespace,
     ) -> Result<(), ProcessingError> {
@@ -624,11 +588,14 @@ impl IngestorProcess {
         if let Some(max_age_secs) = self.state.max_file_age_secs {
             let delta = Utc::now() - s3_event.event_time;
             if delta.num_seconds() > max_age_secs as i64 {
-                return Err(ProcessingError::FileTooOld {
-                    bucket: s3_event.s3.bucket.name.clone(),
-                    key: s3_event.s3.object.key.clone(),
-                    deferred_queue: self.state.deferred_queue_url.clone().unwrap(),
-                });
+                if self.state.deferred_queue_url.is_some() {
+                    self.state.retry_entries.push(SendMessageBatchRequestEntry::builder()
+                        .id(message_id)
+                        .message_body(s3_event.to_string())
+                        .build()
+                        .expect("all required builder params specified"));
+                }
+                return Ok(());
             }
         }
 
@@ -829,27 +796,25 @@ impl IngestorProcess {
     }
 
     async fn delete_messages(
-        &mut self,
-        entries: Vec<DeleteMessageBatchRequestEntry>,
+        &mut self
     ) -> Result<DeleteMessageBatchOutput, SdkError<DeleteMessageBatchError, HttpResponse>> {
         self.state
             .sqs_client
             .delete_message_batch()
             .queue_url(self.state.queue_url.clone())
-            .set_entries(Some(entries))
+            .set_entries(Some(self.state.delete_entries.clone()))
             .send()
             .await
     }
 
     async fn send_messages(
         &mut self,
-        entries: Vec<SendMessageBatchRequestEntry>,
     ) -> Result<SendMessageBatchOutput, SdkError<SendMessageBatchError, HttpResponse>> {
         self.state
             .sqs_client
             .send_message_batch()
             .queue_url(self.state.deferred_queue_url.clone().unwrap())
-            .set_entries(Some(entries))
+            .set_entries(Some(self.state.retry_entries.clone()))
             .send()
             .await
     }
