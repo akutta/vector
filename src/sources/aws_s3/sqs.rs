@@ -280,7 +280,7 @@ pub struct State {
 
     max_file_age_secs: Option<u64>,
     deferred_queue_url: Option<String>,
-    retry_entries: Vec<SendMessageBatchRequestEntry>,
+    deferred_entries: Vec<SendMessageBatchRequestEntry>,
 }
 
 pub(super) struct Ingestor {
@@ -326,7 +326,7 @@ impl Ingestor {
             deferred_queue_url: config.deferred_queue_url,
             max_file_age_secs: config.max_file_age_secs,
 
-            retry_entries: Vec::new(),
+            deferred_entries: Vec::new(),
         });
 
         Ok(Ingestor { state })
@@ -422,7 +422,7 @@ impl IngestorProcess {
             .unwrap_or_default();
 
         let mut delete_entries = Vec::new();
-        self.state.retry_entries.clear();
+        self.state.deferred_entries.clear();
 
         for message in messages {
             let receipt_handle = match message.receipt_handle {
@@ -469,8 +469,11 @@ impl IngestorProcess {
             }
         }
 
-        if !self.state.retry_entries.is_empty() {
-            let cloned_entries = self.state.retry_entries.clone();
+        debug!(?self.state.deferred_entries, "Deferred messages.");
+        debug!(?delete_entries, "Deleting messages.");
+
+        if !self.state.deferred_entries.is_empty() {
+            let cloned_entries = self.state.deferred_entries.clone();
             match self.send_messages().await {
                 Ok(result) => {
                     if !result.successful.is_empty() {
@@ -483,7 +486,6 @@ impl IngestorProcess {
                         emit!(SqsMessageSentPartialError {
                             entries: result.failed
                         })
-
                     }
                 }
                 Err(err) => {
@@ -498,7 +500,7 @@ impl IngestorProcess {
         if !delete_entries.is_empty() {
             // We need these for a correct error message if the batch fails overall.
             let cloned_entries = delete_entries.clone();
-            match self.delete_messages().await {
+            match self.delete_messages(delete_entries).await {
                 Ok(result) => {
                     // Batch deletes can have partial successes/failures, so we have to check
                     // for both cases and emit accordingly.
@@ -589,7 +591,7 @@ impl IngestorProcess {
             let delta = Utc::now() - s3_event.event_time;
             if delta.num_seconds() > max_age_secs as i64 {
                 if self.state.deferred_queue_url.is_some() {
-                    self.state.retry_entries.push(SendMessageBatchRequestEntry::builder()
+                    self.state.deferred_entries.push(SendMessageBatchRequestEntry::builder()
                         .id(message_id)
                         .message_body(s3_event.to_string())
                         .build()
@@ -796,13 +798,14 @@ impl IngestorProcess {
     }
 
     async fn delete_messages(
-        &mut self
+        &mut self,
+        delete_entries: Vec<DeleteMessageBatchRequestEntry>
     ) -> Result<DeleteMessageBatchOutput, SdkError<DeleteMessageBatchError, HttpResponse>> {
         self.state
             .sqs_client
             .delete_message_batch()
             .queue_url(self.state.queue_url.clone())
-            .set_entries(Some(self.state.delete_entries.clone()))
+            .set_entries(Some(delete_entries.clone()))
             .send()
             .await
     }
@@ -814,7 +817,7 @@ impl IngestorProcess {
             .sqs_client
             .send_message_batch()
             .queue_url(self.state.deferred_queue_url.clone().unwrap())
-            .set_entries(Some(self.state.retry_entries.clone()))
+            .set_entries(Some(self.state.deferred_entries.clone()))
             .send()
             .await
     }
