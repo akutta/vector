@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod region;
 pub mod timeout;
+pub mod credentials_cache;
 
 pub use auth::{AwsAuthentication, ImdsAuthentication};
 use aws_config::{
