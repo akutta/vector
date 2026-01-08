@@ -1,31 +1,40 @@
 //! Implementation of the `clickhouse` sink.
 
-use super::{config::Format, request_builder::ClickhouseRequestBuilder};
+use std::fmt::Debug;
+
+use super::config::Format;
 use crate::sinks::{prelude::*, util::http::HttpRequest};
 
-pub struct ClickhouseSink<S> {
+/// Generic ClickHouse sink that can use different request builders.
+pub struct ClickhouseSink<S, R> {
     batch_settings: BatcherSettings,
     service: S,
     database: Template,
     table: Template,
     format: Format,
-    request_builder: ClickhouseRequestBuilder,
+    request_builder: R,
 }
 
-impl<S> ClickhouseSink<S>
+impl<S, R> ClickhouseSink<S, R>
 where
     S: Service<HttpRequest<PartitionKey>> + Send + 'static,
     S::Future: Send + 'static,
     S::Response: DriverResponse + Send + 'static,
-    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
+    S::Error: Debug + Into<crate::Error> + Send,
+    R: RequestBuilder<(PartitionKey, Vec<Event>), Request = HttpRequest<PartitionKey>>
+        + Send
+        + Sync
+        + 'static,
+    R::Error: Debug + std::fmt::Display + Into<crate::Error> + Send,
 {
-    pub const fn new(
+    #[allow(clippy::missing_const_for_fn)] // Cannot be const: takes non-const parameters
+    pub fn new(
         batch_settings: BatcherSettings,
         service: S,
         database: Template,
         table: Template,
         format: Format,
-        request_builder: ClickhouseRequestBuilder,
+        request_builder: R,
     ) -> Self {
         Self {
             batch_settings,
@@ -66,12 +75,17 @@ where
 }
 
 #[async_trait::async_trait]
-impl<S> StreamSink<Event> for ClickhouseSink<S>
+impl<S, R> StreamSink<Event> for ClickhouseSink<S, R>
 where
     S: Service<HttpRequest<PartitionKey>> + Send + 'static,
     S::Future: Send + 'static,
     S::Response: DriverResponse + Send + 'static,
-    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
+    S::Error: Debug + Into<crate::Error> + Send,
+    R: RequestBuilder<(PartitionKey, Vec<Event>), Request = HttpRequest<PartitionKey>>
+        + Send
+        + Sync
+        + 'static,
+    R::Error: Debug + std::fmt::Display + Into<crate::Error> + Send,
 {
     async fn run(
         self: Box<Self>,
@@ -90,14 +104,14 @@ pub struct PartitionKey {
 }
 
 /// KeyPartitioner that partitions events by (database, table) pair.
-struct KeyPartitioner {
+pub struct KeyPartitioner {
     database: Template,
     table: Template,
     format: Format,
 }
 
 impl KeyPartitioner {
-    const fn new(database: Template, table: Template, format: Format) -> Self {
+    pub const fn new(database: Template, table: Template, format: Format) -> Self {
         Self {
             database,
             table,
