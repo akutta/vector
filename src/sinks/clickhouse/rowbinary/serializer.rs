@@ -19,21 +19,9 @@ pub struct RowBinarySerializerConfig {
     #[serde(skip)]
     pub schema: Option<Arc<TableSchema>>,
 
-    /// Schema configuration (required columns, defaults, etc.).
+    /// Schema configuration (required columns, defaults, allow_nullable_fields, etc.).
     #[serde(flatten)]
     pub schema_config: SchemaConfig,
-
-    /// Allow nullable fields to be null even if not explicitly nullable.
-    ///
-    /// When enabled, fields can be null even if the schema doesn't mark them as nullable.
-    /// When disabled, null values for non-nullable fields will cause an error.
-    #[serde(default = "default_allow_nullable_fields")]
-    pub allow_nullable_fields: bool,
-}
-
-#[allow(dead_code)] // May be used in the future
-const fn default_allow_nullable_fields() -> bool {
-    false
 }
 
 #[allow(dead_code)] // May be used in the future

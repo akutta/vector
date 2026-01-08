@@ -422,7 +422,7 @@ async fn insert_events_binary_format() {
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
             required_columns: vec!["host".to_string(), "message".to_string()],
-            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::UseDefault,
+            allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),
         batch,
@@ -480,7 +480,7 @@ async fn insert_events_binary_format_with_nullable() {
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
             required_columns: vec!["host".to_string()],
-            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::InsertNull,
+            allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),
         batch,
@@ -538,7 +538,7 @@ async fn insert_events_binary_format_with_arrays() {
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
             required_columns: vec!["host".to_string()],
-            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::UseDefault,
+            allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),
         batch,

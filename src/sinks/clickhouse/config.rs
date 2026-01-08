@@ -77,22 +77,6 @@ impl fmt::Display for Format {
     }
 }
 
-/// Behavior when an event field specified in the schema mapping is missing.
-#[configurable_component]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum OnMissingField {
-    /// Use the default value for the column type.
-    #[default]
-    UseDefault,
-
-    /// Drop the entire event.
-    DropEvent,
-
-    /// Insert NULL (only valid for Nullable columns).
-    InsertNull,
-}
-
 /// Schema configuration for binary formats.
 ///
 /// When using `RowBinaryWithNamesAndTypes` format, the schema is fetched from the
@@ -114,14 +98,22 @@ pub struct SchemaConfig {
     #[serde(default)]
     pub required_columns: Vec<String>,
 
-    /// Behavior when an event field for a column is missing.
+    /// Allow null values for fields that are missing from events.
+    ///
+    /// When enabled, missing event fields will use NULL for Nullable columns, or the type's
+    /// default value (0, empty string, etc.) for non-nullable columns. This is useful when
+    /// working with schemas where not all fields are always present.
+    ///
+    /// When disabled (default), missing fields will cause an error, ensuring all expected
+    /// data is present before sending to ClickHouse.
     #[serde(default)]
-    pub on_missing_field: OnMissingField,
+    pub allow_nullable_fields: bool,
 
     /// Default values to use when event fields are missing.
     ///
     /// The key is the column name, and the value is the default value as a string.
-    /// The value will be converted to the column's type.
+    /// The value will be converted to the column's type. These defaults take precedence
+    /// over the `allow_nullable_fields` behavior.
     #[configurable(metadata(
         docs::examples = "severity = \"info\"",
         docs::examples = "status_code = \"0\""

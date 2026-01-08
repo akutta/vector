@@ -7,7 +7,7 @@ use ordered_float::NotNan;
 use vector_lib::event::{Event, LogEvent, Value};
 use vrl::path::{OwnedTargetPath, parse_target_path};
 
-use crate::sinks::clickhouse::config::{OnMissingField, SchemaConfig};
+use crate::sinks::clickhouse::config::SchemaConfig;
 
 use super::schema::TableSchema;
 
@@ -29,8 +29,8 @@ pub struct RowBinaryEncoder {
     /// Pre-parsed VRL paths for each column (for O(1) lookup without per-event parsing)
     /// Vec indexed by column index, None if no field mapping for that column
     column_field_paths: Vec<Option<OwnedTargetPath>>,
-    /// Behavior for missing fields
-    pub on_missing_field: OnMissingField,
+    /// Allow null/default values for missing fields
+    pub allow_nullable_fields: bool,
     /// Default values for missing fields (by column index)
     pub defaults: HashMap<usize, Value>,
     /// Pre-computed header bytes (column names and types) to avoid recomputing for each batch
@@ -111,7 +111,7 @@ impl RowBinaryEncoder {
             column_types,
             column_type_strings,
             column_field_paths,
-            on_missing_field: config.on_missing_field,
+            allow_nullable_fields: config.allow_nullable_fields,
             defaults,
             header_bytes,
         })
@@ -157,32 +157,31 @@ impl RowBinaryEncoder {
 
     /// Get the value for a column from a log event.
     fn get_column_value(&self, log: &LogEvent, col_idx: usize) -> Result<Value, RowBinaryError> {
+        // First, try to get the value from the event
         if let Some(Some(parsed_path)) = self.column_field_paths.get(col_idx) {
             if let Some(value) = log.get(parsed_path) {
                 return Ok(value.clone());
             }
         }
-        match self.on_missing_field {
-            OnMissingField::UseDefault => {
-                if let Some(default) = self.defaults.get(&col_idx) {
-                    Ok(default.clone())
-                } else {
-                    Ok(self.column_types[col_idx].default_value())
-                }
+
+        // Value is missing - check for configured default first
+        if let Some(default) = self.defaults.get(&col_idx) {
+            return Ok(default.clone());
+        }
+
+        // No configured default - behavior depends on allow_nullable_fields
+        if self.allow_nullable_fields {
+            // Permissive mode: use NULL for Nullable columns, type default otherwise
+            if matches!(self.column_types[col_idx], ClickHouseType::Nullable(_)) {
+                Ok(Value::Null)
+            } else {
+                Ok(self.column_types[col_idx].default_value())
             }
-            OnMissingField::InsertNull => {
-                // Check if the column is nullable
-                if matches!(self.column_types[col_idx], ClickHouseType::Nullable(_)) {
-                    Ok(Value::Null)
-                } else {
-                    Err(RowBinaryError::MissingField {
-                        field: self.column_names[col_idx].clone(),
-                    })
-                }
-            }
-            OnMissingField::DropEvent => Err(RowBinaryError::MissingField {
+        } else {
+            // Strict mode: error on missing field
+            Err(RowBinaryError::MissingField {
                 field: self.column_names[col_idx].clone(),
-            }),
+            })
         }
     }
 
