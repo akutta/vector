@@ -2,6 +2,8 @@
 
 use snafu::Snafu;
 
+use crate::sinks::clickhouse::type_parser::TypeParseError;
+
 /// Errors that can occur during RowBinary serialization.
 #[derive(Debug, Snafu)]
 pub enum RowBinaryError {
@@ -30,5 +32,15 @@ pub enum RowBinaryError {
 impl From<std::io::Error> for RowBinaryError {
     fn from(source: std::io::Error) -> Self {
         RowBinaryError::IoError { source }
+    }
+}
+
+impl From<TypeParseError> for RowBinaryError {
+    fn from(e: TypeParseError) -> Self {
+        match e {
+            TypeParseError::UnsupportedType { type_name } => RowBinaryError::UnsupportedType { type_name },
+            TypeParseError::InvalidSpec { spec } => RowBinaryError::InvalidTypeSpec { spec },
+            TypeParseError::MalformedArguments { input } => RowBinaryError::InvalidTypeSpec { spec: input },
+        }
     }
 }
