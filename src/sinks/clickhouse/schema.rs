@@ -26,9 +26,6 @@ pub enum SchemaError {
     #[snafu(display("Failed to parse schema response: {}", source))]
     ParseFailed { source: serde_json::Error },
 
-    #[snafu(display("Required column '{}' not found in table schema", column))]
-    RequiredColumnMissing { column: String },
-
     #[snafu(display("Table '{}' has no columns", table))]
     EmptyTable { table: String },
 }
@@ -76,18 +73,6 @@ impl TableSchema {
     /// Check if a column exists.
     pub fn has_column(&self, name: &str) -> bool {
         self.columns.contains_key(name)
-    }
-
-    /// Validate that all required columns exist in the schema.
-    pub fn validate_required_columns(&self, required: &[String]) -> Result<(), SchemaError> {
-        for column in required {
-            if !self.has_column(column) {
-                return Err(SchemaError::RequiredColumnMissing {
-                    column: column.clone(),
-                });
-            }
-        }
-        Ok(())
     }
 }
 
@@ -253,51 +238,6 @@ mod tests {
             is_nullable: false,
         };
         assert!(!required_col.can_be_omitted());
-    }
-
-    #[test]
-    fn test_validate_required_columns() {
-        let mut columns = HashMap::new();
-        columns.insert(
-            "timestamp".to_string(),
-            ColumnInfo {
-                name: "timestamp".to_string(),
-                column_type: "DateTime64(9)".to_string(),
-                default_expression: None,
-                is_nullable: false,
-            },
-        );
-        columns.insert(
-            "message".to_string(),
-            ColumnInfo {
-                name: "message".to_string(),
-                column_type: "String".to_string(),
-                default_expression: None,
-                is_nullable: false,
-            },
-        );
-
-        let schema = TableSchema {
-            database: "default".to_string(),
-            table: "logs".to_string(),
-            columns,
-            column_order: vec!["timestamp".to_string(), "message".to_string()],
-        };
-
-        // Valid required columns
-        assert!(
-            schema
-                .validate_required_columns(&["timestamp".to_string(), "message".to_string()])
-                .is_ok()
-        );
-
-        // Missing required column
-        let result =
-            schema.validate_required_columns(&["timestamp".to_string(), "host".to_string()]);
-        assert!(matches!(
-            result,
-            Err(SchemaError::RequiredColumnMissing { column }) if column == "host"
-        ));
     }
 }
 

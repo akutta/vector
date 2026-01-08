@@ -421,7 +421,6 @@ async fn insert_events_binary_format() {
         compression: Compression::None,
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
-            required_columns: vec!["host".to_string(), "message".to_string()],
             allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),
@@ -479,7 +478,6 @@ async fn insert_events_binary_format_with_nullable() {
         compression: Compression::None,
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
-            required_columns: vec!["host".to_string()],
             allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),
@@ -537,7 +535,6 @@ async fn insert_events_binary_format_with_arrays() {
         compression: Compression::None,
         format: Format::RowBinaryWithNamesAndTypes,
         schema: Some(SchemaConfig {
-            required_columns: vec!["host".to_string()],
             allow_nullable_fields: true,
             defaults: HashMap::new(),
         }),

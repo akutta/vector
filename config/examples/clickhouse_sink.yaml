@@ -1,7 +1,16 @@
-# ClickHouse Sink Configuration Example
+# ClickHouse Sink Configuration Examples
 # ------------------------------------------------------------------------------
 # This demonstrates how to configure Vector to send log data to ClickHouse
-# using both JSON and efficient RowBinary formats.
+# using all available encoding formats:
+#
+# JSON Formats (text-based, human-readable):
+#   - json_each_row:  One JSON object per line (default, most compatible)
+#   - json_as_object: Entire batch as a JSON object
+#   - json_as_string: JSON data as escaped string
+#
+# Binary Formats (efficient, schema-based):
+#   - arrow_stream:                   Apache Arrow IPC streaming format (beta)
+#   - row_binary_with_names_and_types: ClickHouse native binary format (beta)
 
 data_dir: "/var/lib/vector"
 
@@ -33,16 +42,28 @@ transforms:
         _ => "unknown"
       })
 
-# Sinks: Send data to ClickHouse
+# ==============================================================================
+# SINK CONFIGURATIONS BY ENCODER TYPE
+# ==============================================================================
+
 sinks:
-  # Example 1: JSON format (default, backwards compatible)
-  clickhouse_json:
+  # --------------------------------------------------------------------------
+  # FORMAT: json_each_row (Default)
+  # --------------------------------------------------------------------------
+  # Most widely compatible JSON format. Each event becomes a single JSON line.
+  # Best for: General use, debugging, maximum compatibility
+  #
+  # Example output:
+  #   {"timestamp":"2024-01-01T00:00:00Z","host":"server1","message":"Hello"}
+  #   {"timestamp":"2024-01-01T00:00:01Z","host":"server2","message":"World"}
+  #
+  clickhouse_json_each_row:
     type: "clickhouse"
     inputs: ["parse_logs"]
     endpoint: "http://localhost:8123"
     database: "logs"
     table: "application_logs"
-    format: "json_each_row"  # Options: json_each_row, json_as_object, json_as_string
+    format: "json_each_row"
     compression: "gzip"
     date_time_best_effort: true
     skip_unknown_fields: true
@@ -52,69 +73,195 @@ sinks:
     auth:
       user: "default"
       password: "password"
-    tls:
-      enabled: false
     request:
       timeout_secs: 60
       retry_attempts: 3
 
-  # Example 2: RowBinary format (efficient binary encoding with schema)
-  clickhouse_rowbinary:
+  # --------------------------------------------------------------------------
+  # FORMAT: json_as_object
+  # --------------------------------------------------------------------------
+  # Inserts each event as a single JSON object into a column.
+  # Best for: Storing semi-structured data in a JSON column type
+  #
+  # Requires a table with a JSON or String column to hold the entire object.
+  # ClickHouse table example:
+  #   CREATE TABLE logs.json_objects (data JSON) ENGINE = MergeTree() ORDER BY tuple()
+  #
+  clickhouse_json_as_object:
     type: "clickhouse"
     inputs: ["parse_logs"]
     endpoint: "http://localhost:8123"
     database: "logs"
-    table: "application_logs_binary"
-    format: "row_binary_with_names_and_types"
+    table: "json_objects"
+    format: "json_as_object"
     compression: "gzip"
-    date_time_best_effort: true
-    schema:
-      # Required columns that must exist in the ClickHouse table
-      required_columns:
-        - "timestamp"
-        - "host"
-        - "message"
-      # Behavior when event field is missing
-      on_missing_field: "use_default"  # Options: use_default, drop_event, insert_null
-      # Default values for missing fields
-      defaults:
-        severity: "info"
-        status_code: "0"
     batch:
-      max_bytes: 10485760  # 10MB
+      max_bytes: 10485760
       timeout_secs: 30
     auth:
       user: "default"
       password: "password"
-    tls:
-      enabled: false
-    request:
-      timeout_secs: 60
-      retry_attempts: 3
 
-  # Example 3: ClickHouse with async inserts (for high-throughput scenarios)
-  clickhouse_async:
+  # --------------------------------------------------------------------------
+  # FORMAT: json_as_string
+  # --------------------------------------------------------------------------
+  # Inserts each event as a JSON-encoded string.
+  # Best for: Storing raw JSON for later processing or when schema is unknown
+  #
+  # ClickHouse table example:
+  #   CREATE TABLE logs.json_strings (data String) ENGINE = MergeTree() ORDER BY tuple()
+  #
+  clickhouse_json_as_string:
     type: "clickhouse"
     inputs: ["parse_logs"]
     endpoint: "http://localhost:8123"
     database: "logs"
-    table: "application_logs_async"
-    format: "json_each_row"
+    table: "json_strings"
+    format: "json_as_string"
     compression: "gzip"
-    query_settings:
-      async_insert_settings:
-        # Enable async inserts for better performance
-        wait_for_async_insert: 1
-        wait_for_async_insert_timeout: 200  # milliseconds
-        async_insert_max_data_size: 10485760  # 10MB
     batch:
       max_bytes: 10485760
-      timeout_secs: 5  # Shorter timeout since async inserts handle batching
+      timeout_secs: 30
     auth:
       user: "default"
       password: "password"
 
-  # Example 4: ClickHouse with distributed table support
+  # --------------------------------------------------------------------------
+  # FORMAT: arrow_stream (Beta)
+  # --------------------------------------------------------------------------
+  # Apache Arrow IPC streaming format with automatic schema inference.
+  # Best for: High-throughput scenarios, columnar analytics, reduced CPU usage
+  #
+  # Features:
+  #   - Schema automatically fetched from ClickHouse table at startup
+  #   - Columnar encoding for efficient compression and processing
+  #   - Type-safe encoding based on table schema
+  #
+  # Requirements:
+  #   - Static table and database names (no templates)
+  #   - Table must exist in ClickHouse before starting Vector
+  #
+  # ClickHouse table example:
+  #   CREATE TABLE logs.arrow_logs (
+  #     timestamp DateTime64(3),
+  #     host String,
+  #     message String,
+  #     severity String
+  #   ) ENGINE = MergeTree() ORDER BY timestamp
+  #
+  clickhouse_arrow_stream:
+    type: "clickhouse"
+    inputs: ["parse_logs"]
+    endpoint: "http://localhost:8123"
+    database: "logs"
+    table: "arrow_logs"
+    format: "arrow_stream"
+    compression: "gzip"
+    # batch_encoding is required for arrow_stream format
+    batch_encoding:
+      arrow_stream:
+        # Allow null values for missing fields (optional, default: false)
+        allow_nullable_fields: true
+    batch:
+      max_bytes: 10485760
+      timeout_secs: 30
+    auth:
+      user: "default"
+      password: "password"
+    request:
+      timeout_secs: 60
+      retry_attempts: 3
+
+  # --------------------------------------------------------------------------
+  # FORMAT: row_binary_with_names_and_types (Beta)
+  # --------------------------------------------------------------------------
+  # ClickHouse native binary format with schema validation.
+  # Best for: Maximum performance, strict schema enforcement, production workloads
+  #
+  # Features:
+  #   - Native ClickHouse binary encoding (most efficient)
+  #   - Schema validation at startup
+  #   - Configurable handling of missing fields
+  #   - Default value support
+  #
+  # Requirements:
+  #   - Static table and database names (no templates)
+  #   - Schema configuration required
+  #   - Table must exist in ClickHouse before starting Vector
+  #
+  # ClickHouse table example:
+  #   CREATE TABLE logs.binary_logs (
+  #     timestamp DateTime64(3),
+  #     host String,
+  #     message String,
+  #     severity String DEFAULT 'info',
+  #     status_code UInt16 DEFAULT 0
+  #   ) ENGINE = MergeTree() ORDER BY timestamp
+  #
+  clickhouse_row_binary:
+    type: "clickhouse"
+    inputs: ["parse_logs"]
+    endpoint: "http://localhost:8123"
+    database: "logs"
+    table: "binary_logs"
+    format: "row_binary_with_names_and_types"
+    compression: "gzip"
+    schema:
+      # Allow null/default for missing event fields
+      allow_nullable_fields: true
+      # Default values when fields are missing from events
+      defaults:
+        severity: "info"
+        status_code: "0"
+    batch:
+      max_bytes: 10485760
+      timeout_secs: 30
+    auth:
+      user: "default"
+      password: "password"
+    request:
+      timeout_secs: 60
+      retry_attempts: 3
+
+  # ==========================================================================
+  # ADDITIONAL FEATURES (combinable with any format)
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Async Inserts (High-throughput optimization)
+  # --------------------------------------------------------------------------
+  # ClickHouse handles batching server-side for improved write performance.
+  # Compatible with any format.
+  #
+  clickhouse_async_inserts:
+    type: "clickhouse"
+    inputs: ["parse_logs"]
+    endpoint: "http://localhost:8123"
+    database: "logs"
+    table: "application_logs"
+    format: "json_each_row"
+    compression: "gzip"
+    query_settings:
+      async_insert_settings:
+        enabled: true
+        wait_for_processing: true
+        wait_for_processing_timeout: 200  # milliseconds
+        max_data_size: 10485760  # 10MB buffer before flush
+        max_query_number: 450   # max queries before flush
+        deduplicate: false
+    batch:
+      max_bytes: 1048576  # Smaller batches - async handles buffering
+      timeout_secs: 5
+    auth:
+      user: "default"
+      password: "password"
+
+  # --------------------------------------------------------------------------
+  # Distributed Table Support
+  # --------------------------------------------------------------------------
+  # Insert into random shards when using Distributed table engine.
+  # Compatible with any format.
+  #
   clickhouse_distributed:
     type: "clickhouse"
     inputs: ["parse_logs"]
@@ -123,7 +270,7 @@ sinks:
     table: "distributed_logs"
     format: "json_each_row"
     compression: "gzip"
-    insert_random_shard: true  # Insert into random shard for distributed tables
+    insert_random_shard: true
     batch:
       max_bytes: 10485760
       timeout_secs: 30
@@ -131,7 +278,27 @@ sinks:
       user: "default"
       password: "password"
 
-
-
+  # --------------------------------------------------------------------------
+  # TLS/SSL Configuration
+  # --------------------------------------------------------------------------
+  # Secure connections to ClickHouse.
+  # Compatible with any format.
+  #
+  clickhouse_tls:
+    type: "clickhouse"
+    inputs: ["parse_logs"]
+    endpoint: "https://clickhouse.example.com:8443"
+    database: "logs"
+    table: "secure_logs"
+    format: "json_each_row"
+    compression: "gzip"
+    auth:
+      user: "default"
+      password: "password"
+    tls:
+      ca_file: "/path/to/ca.crt"
+      crt_file: "/path/to/client.crt"
+      key_file: "/path/to/client.key"
+      verify_hostname: true
 
 

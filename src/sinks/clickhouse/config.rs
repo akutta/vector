@@ -86,18 +86,6 @@ impl fmt::Display for Format {
 #[derive(Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaConfig {
-    /// List of table columns that must exist.
-    ///
-    /// If any of these columns are not found in the table schema at startup, the sink will fail to initialize.
-    /// This provides early validation that the expected schema exists.
-    #[configurable(metadata(
-        docs::examples = "timestamp",
-        docs::examples = "host",
-        docs::examples = "message"
-    ))]
-    #[serde(default)]
-    pub required_columns: Vec<String>,
-
     /// Allow null values for fields that are missing from events.
     ///
     /// When enabled, missing event fields will use NULL for Nullable columns, or the type's
@@ -410,11 +398,6 @@ impl ClickhouseConfig {
             .fetch_schema(database_str, table_str)
             .await
             .map_err(|e| format!("Failed to fetch table schema: {}", e))?;
-
-        // Validate required columns exist in the table schema
-        table_schema
-            .validate_required_columns(&schema_config.required_columns)
-            .map_err(|e| format!("Schema validation failed: {}", e))?;
 
         // Create the RowBinary encoder
         let encoder = RowBinaryEncoder::new(&table_schema, schema_config)
