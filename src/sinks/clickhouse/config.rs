@@ -372,25 +372,17 @@ impl ClickhouseConfig {
         )?;
 
         // For binary format, we need to know the table name at build time to fetch the schema.
-        // If the table is templated, we can't fetch the schema ahead of time.
-        let table_str = self.table.get_ref();
-        if table_str.contains("{{") || table_str.contains("{%") {
+        // If the table or database is templated, we can't fetch the schema ahead of time.
+        if self.table.is_dynamic() || database.is_dynamic() {
             return Err(
-                "Templated table names are not supported with binary format. \
-                 Use a static table name or switch to a JSON format."
+                "Templated table/database names are not supported with binary format. \
+                 Use static names or switch to a JSON format."
                     .into(),
             );
         }
 
-        // Similarly for database
+        let table_str = self.table.get_ref();
         let database_str = database.get_ref();
-        if database_str.contains("{{") || database_str.contains("{%") {
-            return Err(
-                "Templated database names are not supported with binary format. \
-                 Use a static database name or switch to a JSON format."
-                    .into(),
-            );
-        }
 
         // Fetch table schema from ClickHouse
         let schema_fetcher = SchemaFetcher::new(client.clone(), endpoint.clone(), auth.clone());
