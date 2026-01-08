@@ -36,10 +36,11 @@ impl RetryLogic for ClickhouseRetryLogic {
     }
 
     fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
-        match response.http_response.status() {
-            StatusCode::INTERNAL_SERVER_ERROR => {
-                let body = response.http_response.body();
+        let status = response.http_response.status();
+        let body = response.http_response.body();
 
+        match status {
+            StatusCode::INTERNAL_SERVER_ERROR => {
                 // Currently, ClickHouse returns 500's incorrect data and type mismatch errors.
                 // This attempts to check if the body starts with `Code: {code_num}` and to not
                 // retry those errors.
@@ -48,13 +49,34 @@ impl RetryLogic for ClickhouseRetryLogic {
                 // Error code definitions: https://github.com/ClickHouse/ClickHouse/blob/master/dbms/src/Common/ErrorCodes.cpp
                 //
                 // Fix already merged: https://github.com/ClickHouse/ClickHouse/pull/6271
-                if body.starts_with(b"Code: 117") {
-                    RetryAction::DontRetry("incorrect data".into())
-                } else if body.starts_with(b"Code: 53") {
-                    RetryAction::DontRetry("type mismatch".into())
+                if body.starts_with(b"Code: 117")
+                    || body.starts_with(b"Code: 53")
+                    || body.starts_with(b"Code: 33")
+                {
+                    let error_msg = String::from_utf8_lossy(body);
+                    error!(
+                        message = "ClickHouse rejected request with data error",
+                        error = %error_msg
+                    );
+
+                    if body.starts_with(b"Code: 117") {
+                        RetryAction::DontRetry("incorrect data".into())
+                    } else if body.starts_with(b"Code: 53") {
+                        RetryAction::DontRetry("type mismatch".into())
+                    } else {
+                        RetryAction::DontRetry("cannot read all data".into())
+                    }
                 } else {
                     RetryAction::Retry(String::from_utf8_lossy(body).to_string().into())
                 }
+            }
+            StatusCode::BAD_REQUEST => {
+                let error_msg = String::from_utf8_lossy(body);
+                error!(
+                    message = "ClickHouse rejected request with 400 Bad Request",
+                    error = %error_msg
+                );
+                RetryAction::DontRetry(error_msg.to_string().into())
             }
             _ => self.inner.should_retry_response(&response.http_response),
         }
@@ -70,6 +92,8 @@ pub(super) struct ClickhouseServiceRequestBuilder {
     pub(super) insert_random_shard: bool,
     pub(super) compression: Compression,
     pub(super) query_settings: QuerySettingsConfig,
+    /// Whether the schema contains JSON columns (requires input_format_binary_read_json_as_string=1)
+    pub(super) has_json_columns: bool,
 }
 
 impl HttpServiceRequestBuilder<PartitionKey> for ClickhouseServiceRequestBuilder {
@@ -88,6 +112,7 @@ impl HttpServiceRequestBuilder<PartitionKey> for ClickhouseServiceRequestBuilder
             self.date_time_best_effort,
             self.insert_random_shard,
             self.query_settings,
+            self.has_json_columns,
         )?;
 
         let auth: Option<Auth> = self.auth.clone();
@@ -99,6 +124,7 @@ impl HttpServiceRequestBuilder<PartitionKey> for ClickhouseServiceRequestBuilder
         // Set content type based on format
         let content_type = match format {
             Format::ArrowStream => "application/vnd.apache.arrow.stream",
+            Format::RowBinaryWithNamesAndTypes => "application/octet-stream",
             _ => "application/x-ndjson",
         };
 
@@ -140,6 +166,7 @@ fn set_uri_query(
     date_time_best_effort: bool,
     insert_random_shard: bool,
     query_settings: QuerySettingsConfig,
+    has_json_columns: bool,
 ) -> crate::Result<Uri> {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair(
@@ -159,11 +186,21 @@ fn set_uri_query(
         uri.push('/');
     }
 
-    uri.push_str("?input_format_import_nested_json=1&");
-    append_param_bool(&mut uri, "input_format_skip_unknown_fields", skip_unknown);
-    if date_time_best_effort {
+    uri.push_str("?");
+    
+    if format.is_json() {
+        uri.push_str("input_format_import_nested_json=1&");
+        append_param_bool(&mut uri, "input_format_skip_unknown_fields", skip_unknown);
+    }
+
+    if date_time_best_effort && format.is_json() {
         uri.push_str("date_time_input_format=best_effort&")
     }
+    
+    if format.is_binary() && has_json_columns {
+        uri.push_str("input_format_binary_read_json_as_string=1&")
+    }
+    
     if insert_random_shard {
         uri.push_str("insert_distributed_one_random_shard=1&")
     }
@@ -222,6 +259,7 @@ mod tests {
             true,
             false,
             QuerySettingsConfig::default(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -242,6 +280,7 @@ mod tests {
             false,
             false,
             QuerySettingsConfig::default(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -261,6 +300,7 @@ mod tests {
             true,
             false,
             QuerySettingsConfig::default(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -281,6 +321,7 @@ mod tests {
             true,
             false,
             QuerySettingsConfig::default(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -307,6 +348,7 @@ mod tests {
                     ..AsyncInsertSettingsConfig::default()
                 },
             },
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -332,7 +374,101 @@ mod tests {
             false,
             false,
             QuerySettingsConfig::default(),
+            false,
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn encode_with_json_columns_binary_format() {
+        // Test that has_json_columns=true with binary format adds the setting
+        let uri = set_uri_query(
+            &"http://localhost:80".parse().unwrap(),
+            "my_database",
+            "my_table",
+            Format::RowBinaryWithNamesAndTypes,
+            None,
+            false,
+            false,
+            QuerySettingsConfig::default(),
+            true, // has_json_columns
+        )
+        .unwrap();
+        let uri_str = uri.to_string();
+        assert!(
+            uri_str.contains("input_format_binary_read_json_as_string=1"),
+            "URI should contain input_format_binary_read_json_as_string=1 for binary format with JSON columns"
+        );
+        // Verify JSON-specific parameters are NOT included for binary format
+        assert!(
+            !uri_str.contains("input_format_import_nested_json"),
+            "URI should NOT contain input_format_import_nested_json for binary format"
+        );
+        assert!(
+            !uri_str.contains("input_format_skip_unknown_fields"),
+            "URI should NOT contain input_format_skip_unknown_fields for binary format"
+        );
+        assert!(
+            !uri_str.contains("date_time_input_format"),
+            "URI should NOT contain date_time_input_format for binary format"
+        );
+    }
+    
+    #[test]
+    fn encode_binary_format_no_json_params() {
+        // Test that binary format does NOT include JSON-specific parameters
+        let uri = set_uri_query(
+            &"http://localhost:80".parse().unwrap(),
+            "my_database",
+            "my_table",
+            Format::RowBinaryWithNamesAndTypes,
+            Some(true), // skip_unknown_fields (should be ignored for binary)
+            true,       // date_time_best_effort (should be ignored for binary)
+            false,
+            QuerySettingsConfig::default(),
+            false, // has_json_columns
+        )
+        .unwrap();
+        let uri_str = uri.to_string();
+        // Verify JSON-specific parameters are NOT included
+        assert!(
+            !uri_str.contains("input_format_import_nested_json"),
+            "URI should NOT contain input_format_import_nested_json for binary format"
+        );
+        assert!(
+            !uri_str.contains("input_format_skip_unknown_fields"),
+            "URI should NOT contain input_format_skip_unknown_fields for binary format"
+        );
+        assert!(
+            !uri_str.contains("date_time_input_format"),
+            "URI should NOT contain date_time_input_format for binary format"
+        );
+        // Verify the query format is correct
+        assert!(
+            uri_str.contains("FORMAT+RowBinaryWithNamesAndTypes"),
+            "URI should contain FORMAT RowBinaryWithNamesAndTypes"
+        );
+    }
+
+    #[test]
+    fn encode_with_json_columns_json_format() {
+        // Test that has_json_columns=true with JSON format does NOT add the binary setting
+        let uri = set_uri_query(
+            &"http://localhost:80".parse().unwrap(),
+            "my_database",
+            "my_table",
+            Format::JsonEachRow,
+            None,
+            false,
+            false,
+            QuerySettingsConfig::default(),
+            true, // has_json_columns
+        )
+        .unwrap();
+        assert!(
+            !uri.to_string()
+                .contains("input_format_binary_read_json_as_string"),
+            "URI should NOT contain input_format_binary_read_json_as_string for JSON format"
+        );
     }
 }
