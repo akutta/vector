@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     sync::{
@@ -398,6 +399,181 @@ fn make_event() -> (Event, BatchStatusReceiver) {
     let mut event = LogEvent::from("raw log line").with_batch_notifier(&batch);
     event.insert("host", "example.com");
     (event.into(), receiver)
+}
+
+// Tests for RowBinaryWithNamesAndTypes format
+
+#[tokio::test]
+async fn insert_events_binary_format() {
+    use crate::sinks::clickhouse::config::{Format, SchemaConfig};
+
+    trace_init();
+
+    let table = random_table_name();
+    let host = clickhouse_address();
+
+    let mut batch = BatchConfig::default();
+    batch.max_events = Some(1);
+
+    let config = ClickhouseConfig {
+        endpoint: host.parse().unwrap(),
+        table: table.clone().try_into().unwrap(),
+        compression: Compression::None,
+        format: Format::RowBinaryWithNamesAndTypes,
+        schema: Some(SchemaConfig {
+            required_columns: vec!["host".to_string(), "message".to_string()],
+            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::UseDefault,
+            defaults: HashMap::new(),
+        }),
+        batch,
+        request: TowerRequestConfig {
+            retry_attempts: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let client = ClickhouseClient::new(host.clone());
+    client
+        .create_table(
+            &table,
+            "host String, message String, int_val Int64 DEFAULT 0",
+        )
+        .await;
+
+    let (sink, _hc) = config.build(SinkContext::default()).await.unwrap();
+
+    let (mut input_event, mut receiver) = make_event();
+    input_event.as_mut_log().insert("int_val", 42i64);
+
+    run_and_assert_sink_compliance(sink, stream::once(ready(input_event.clone())), &SINK_TAGS)
+        .await;
+
+    let output = client.select_all(&table).await;
+    assert_eq!(1, output.rows);
+
+    // Verify the data was inserted correctly
+    let row = &output.data[0];
+    assert_eq!(row["host"], "example.com");
+    assert_eq!(row["message"], "raw log line");
+    assert_eq!(row["int_val"], "42");
+
+    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+}
+
+#[tokio::test]
+async fn insert_events_binary_format_with_nullable() {
+    use crate::sinks::clickhouse::config::{Format, SchemaConfig};
+
+    trace_init();
+
+    let table = random_table_name();
+    let host = clickhouse_address();
+
+    let mut batch = BatchConfig::default();
+    batch.max_events = Some(1);
+
+    let config = ClickhouseConfig {
+        endpoint: host.parse().unwrap(),
+        table: table.clone().try_into().unwrap(),
+        compression: Compression::None,
+        format: Format::RowBinaryWithNamesAndTypes,
+        schema: Some(SchemaConfig {
+            required_columns: vec!["host".to_string()],
+            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::InsertNull,
+            defaults: HashMap::new(),
+        }),
+        batch,
+        request: TowerRequestConfig {
+            retry_attempts: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let client = ClickhouseClient::new(host.clone());
+    client
+        .create_table(
+            &table,
+            "host String, message Nullable(String), optional_field Nullable(Int32)",
+        )
+        .await;
+
+    let (sink, _hc) = config.build(SinkContext::default()).await.unwrap();
+
+    let (input_event, mut receiver) = make_event();
+
+    run_and_assert_sink_compliance(sink, stream::once(ready(input_event.clone())), &SINK_TAGS)
+        .await;
+
+    let output = client.select_all(&table).await;
+    assert_eq!(1, output.rows);
+
+    // Verify the data was inserted correctly
+    let row = &output.data[0];
+    assert_eq!(row["host"], "example.com");
+    assert_eq!(row["message"], "raw log line");
+    // optional_field should be NULL
+    assert!(row["optional_field"].is_null());
+
+    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+}
+
+#[tokio::test]
+async fn insert_events_binary_format_with_arrays() {
+    use crate::sinks::clickhouse::config::{Format, SchemaConfig};
+
+    trace_init();
+
+    let table = random_table_name();
+    let host = clickhouse_address();
+
+    let mut batch = BatchConfig::default();
+    batch.max_events = Some(1);
+
+    let config = ClickhouseConfig {
+        endpoint: host.parse().unwrap(),
+        table: table.clone().try_into().unwrap(),
+        compression: Compression::None,
+        format: Format::RowBinaryWithNamesAndTypes,
+        schema: Some(SchemaConfig {
+            required_columns: vec!["host".to_string()],
+            on_missing_field: crate::sinks::clickhouse::config::OnMissingField::UseDefault,
+            defaults: HashMap::new(),
+        }),
+        batch,
+        request: TowerRequestConfig {
+            retry_attempts: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let client = ClickhouseClient::new(host.clone());
+    client
+        .create_table(&table, "host String, tags Array(String)")
+        .await;
+
+    let (sink, _hc) = config.build(SinkContext::default()).await.unwrap();
+
+    let (mut input_event, mut receiver) = make_event();
+    input_event
+        .as_mut_log()
+        .insert("tags", vec!["tag1", "tag2", "tag3"]);
+
+    run_and_assert_sink_compliance(sink, stream::once(ready(input_event.clone())), &SINK_TAGS)
+        .await;
+
+    let output = client.select_all(&table).await;
+    assert_eq!(1, output.rows);
+
+    // Verify the data was inserted correctly
+    let row = &output.data[0];
+    assert_eq!(row["host"], "example.com");
+    let tags: Vec<String> = serde_json::from_value(row["tags"].clone()).unwrap();
+    assert_eq!(tags, vec!["tag1", "tag2", "tag3"]);
+
+    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
 }
 
 struct ClickhouseClient {
