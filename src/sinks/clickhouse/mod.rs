@@ -25,3 +25,4 @@ pub mod rowbinary;
 pub mod schema;
 mod service;
 mod sink;
+pub mod type_parser;

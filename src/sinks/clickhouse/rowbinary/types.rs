@@ -5,6 +5,9 @@ use ordered_float::NotNan;
 use vector_lib::event::{ObjectMap, Value};
 
 use super::error::RowBinaryError;
+use crate::sinks::clickhouse::type_parser::{
+    split_at_top_level_commas, strip_wrapper,
+};
 
 /// Parsed ClickHouse type representation.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,28 +103,22 @@ impl ClickHouseType {
         let type_str = type_str.trim();
 
         // Handle Nullable wrapper
-        if type_str.starts_with("Nullable(") && type_str.ends_with(')') {
-            let inner = &type_str[9..type_str.len() - 1];
+        if let Some(inner) = strip_wrapper(type_str, "Nullable") {
             return Ok(ClickHouseType::Nullable(Box::new(Self::parse(inner)?)));
         }
 
         // Handle LowCardinality wrapper
-        if type_str.starts_with("LowCardinality(") && type_str.ends_with(')') {
-            let inner = &type_str[15..type_str.len() - 1];
-            return Ok(ClickHouseType::LowCardinality(Box::new(Self::parse(
-                inner,
-            )?)));
+        if let Some(inner) = strip_wrapper(type_str, "LowCardinality") {
+            return Ok(ClickHouseType::LowCardinality(Box::new(Self::parse(inner)?)));
         }
 
         // Handle Array type
-        if type_str.starts_with("Array(") && type_str.ends_with(')') {
-            let inner = &type_str[6..type_str.len() - 1];
+        if let Some(inner) = strip_wrapper(type_str, "Array") {
             return Ok(ClickHouseType::Array(Box::new(Self::parse(inner)?)));
         }
 
         // Handle Map type
-        if type_str.starts_with("Map(") && type_str.ends_with(')') {
-            let inner = &type_str[4..type_str.len() - 1];
+        if let Some(inner) = strip_wrapper(type_str, "Map") {
             let (key, value) = Self::split_map_types(inner)?;
             return Ok(ClickHouseType::Map {
                 key: Box::new(Self::parse(key)?),
@@ -130,16 +127,14 @@ impl ClickHouseType {
         }
 
         // Handle Tuple type
-        if type_str.starts_with("Tuple(") && type_str.ends_with(')') {
-            let inner = &type_str[6..type_str.len() - 1];
-            let types = Self::split_tuple_types(inner)?;
+        if let Some(inner) = strip_wrapper(type_str, "Tuple") {
+            let types = Self::split_type_args(inner)?;
             let parsed_types: Result<Vec<_>, _> = types.iter().map(|t| Self::parse(t)).collect();
             return Ok(ClickHouseType::Tuple(parsed_types?));
         }
 
         // Handle FixedString
-        if type_str.starts_with("FixedString(") && type_str.ends_with(')') {
-            let len_str = &type_str[12..type_str.len() - 1];
+        if let Some(len_str) = strip_wrapper(type_str, "FixedString") {
             let len = len_str
                 .parse::<usize>()
                 .map_err(|_| RowBinaryError::InvalidTypeSpec {
@@ -149,18 +144,16 @@ impl ClickHouseType {
         }
 
         // Handle DateTime64
-        if type_str.starts_with("DateTime64(") && type_str.ends_with(')') {
-            let inner = &type_str[11..type_str.len() - 1];
-            let parts: Vec<&str> = inner.split(',').collect();
+        if let Some(inner) = strip_wrapper(type_str, "DateTime64") {
+            let parts = Self::split_type_args(inner)?;
             let precision =
                 parts[0]
-                    .trim()
                     .parse::<u8>()
                     .map_err(|_| RowBinaryError::InvalidTypeSpec {
                         spec: type_str.to_string(),
                     })?;
             let timezone = if parts.len() > 1 {
-                Some(parts[1].trim().trim_matches('\'').to_string())
+                Some(parts[1].trim_matches('\'').to_string())
             } else {
                 None
             };
@@ -171,15 +164,14 @@ impl ClickHouseType {
         }
 
         // Handle DateTime with timezone
-        if type_str.starts_with("DateTime(") && type_str.ends_with(')') {
+        if strip_wrapper(type_str, "DateTime").is_some() {
             // DateTime with timezone - treat as basic DateTime for serialization
             return Ok(ClickHouseType::DateTime);
         }
 
         // Handle Decimal types
-        if type_str.starts_with("Decimal(") && type_str.ends_with(')') {
-            let inner = &type_str[8..type_str.len() - 1];
-            let parts: Vec<&str> = inner.split(',').collect();
+        if let Some(inner) = strip_wrapper(type_str, "Decimal") {
+            let parts = Self::split_type_args(inner)?;
             if parts.len() != 2 {
                 return Err(RowBinaryError::InvalidTypeSpec {
                     spec: type_str.to_string(),
@@ -187,14 +179,12 @@ impl ClickHouseType {
             }
             let precision =
                 parts[0]
-                    .trim()
                     .parse::<u8>()
                     .map_err(|_| RowBinaryError::InvalidTypeSpec {
                         spec: type_str.to_string(),
                     })?;
             let scale =
                 parts[1]
-                    .trim()
                     .parse::<u8>()
                     .map_err(|_| RowBinaryError::InvalidTypeSpec {
                         spec: type_str.to_string(),
@@ -202,8 +192,7 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Decimal { precision, scale });
         }
 
-        if type_str.starts_with("Decimal32(") && type_str.ends_with(')') {
-            let scale_str = &type_str[10..type_str.len() - 1];
+        if let Some(scale_str) = strip_wrapper(type_str, "Decimal32") {
             let scale =
                 scale_str
                     .trim()
@@ -214,8 +203,7 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Decimal32 { scale });
         }
 
-        if type_str.starts_with("Decimal64(") && type_str.ends_with(')') {
-            let scale_str = &type_str[10..type_str.len() - 1];
+        if let Some(scale_str) = strip_wrapper(type_str, "Decimal64") {
             let scale =
                 scale_str
                     .trim()
@@ -226,8 +214,7 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Decimal64 { scale });
         }
 
-        if type_str.starts_with("Decimal128(") && type_str.ends_with(')') {
-            let scale_str = &type_str[11..type_str.len() - 1];
+        if let Some(scale_str) = strip_wrapper(type_str, "Decimal128") {
             let scale =
                 scale_str
                     .trim()
@@ -238,8 +225,7 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Decimal128 { scale });
         }
 
-        if type_str.starts_with("Decimal256(") && type_str.ends_with(')') {
-            let scale_str = &type_str[11..type_str.len() - 1];
+        if let Some(scale_str) = strip_wrapper(type_str, "Decimal256") {
             let scale =
                 scale_str
                     .trim()
@@ -251,14 +237,12 @@ impl ClickHouseType {
         }
 
         // Handle Enum types
-        if type_str.starts_with("Enum8(") && type_str.ends_with(')') {
-            let inner = &type_str[6..type_str.len() - 1];
+        if let Some(inner) = strip_wrapper(type_str, "Enum8") {
             let variants = Self::parse_enum_variants::<i8>(inner)?;
             return Ok(ClickHouseType::Enum8(variants));
         }
 
-        if type_str.starts_with("Enum16(") && type_str.ends_with(')') {
-            let inner = &type_str[7..type_str.len() - 1];
+        if let Some(inner) = strip_wrapper(type_str, "Enum16") {
             let variants = Self::parse_enum_variants::<i16>(inner)?;
             return Ok(ClickHouseType::Enum16(variants));
         }
@@ -294,53 +278,22 @@ impl ClickHouseType {
         }
     }
 
+    /// Split type arguments at top-level commas.
+    fn split_type_args(inner: &str) -> Result<Vec<&str>, RowBinaryError> {
+        split_at_top_level_commas(inner).map_err(|e| RowBinaryError::InvalidTypeSpec {
+            spec: e.to_string(),
+        })
+    }
+
     /// Split Map(K, V) type arguments.
     fn split_map_types(inner: &str) -> Result<(&str, &str), RowBinaryError> {
-        let comma_pos = Self::find_top_level_comma(inner)?;
-        let key = &inner[..comma_pos];
-        let value = &inner[comma_pos + 1..];
-        Ok((key.trim(), value.trim()))
-    }
-
-    /// Split Tuple type arguments.
-    fn split_tuple_types(inner: &str) -> Result<Vec<&str>, RowBinaryError> {
-        let mut result = Vec::new();
-        let mut start = 0;
-        let mut depth = 0;
-
-        for (i, c) in inner.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ',' if depth == 0 => {
-                    result.push(inner[start..i].trim());
-                    start = i + 1;
-                }
-                _ => {}
-            }
+        let args = Self::split_type_args(inner)?;
+        if args.len() != 2 {
+            return Err(RowBinaryError::InvalidTypeSpec {
+                spec: inner.to_string(),
+            });
         }
-
-        if start < inner.len() {
-            result.push(inner[start..].trim());
-        }
-
-        Ok(result)
-    }
-
-    /// Find the top-level comma position for splitting type arguments.
-    fn find_top_level_comma(s: &str) -> Result<usize, RowBinaryError> {
-        let mut depth = 0;
-        for (i, c) in s.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ',' if depth == 0 => return Ok(i),
-                _ => {}
-            }
-        }
-        Err(RowBinaryError::InvalidTypeSpec {
-            spec: s.to_string(),
-        })
+        Ok((args[0], args[1]))
     }
 
     /// Parse enum variants from the inner string.
@@ -353,7 +306,7 @@ impl ClickHouseType {
         let mut variants = Vec::new();
 
         // Simple parsing: split by comma at top level
-        for part in Self::split_tuple_types(inner)? {
+        for part in Self::split_type_args(inner)? {
             // Each part is like 'name' = value
             let eq_pos = part
                 .rfind('=')

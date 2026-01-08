@@ -2,81 +2,9 @@
 
 use arrow::datatypes::{DataType, TimeUnit};
 
-const DECIMAL32_PRECISION: u8 = 9;
-const DECIMAL64_PRECISION: u8 = 18;
-const DECIMAL128_PRECISION: u8 = 38;
-const DECIMAL256_PRECISION: u8 = 76;
-
-/// Represents a ClickHouse type with its modifiers and nested structure.
-#[derive(Debug, PartialEq, Clone)]
-pub enum ClickHouseType<'a> {
-    /// A primitive type like String, Int64, DateTime, etc.
-    Primitive(&'a str),
-    /// Nullable(T)
-    Nullable(Box<ClickHouseType<'a>>),
-    /// LowCardinality(T)
-    LowCardinality(Box<ClickHouseType<'a>>),
-}
-
-impl<'a> ClickHouseType<'a> {
-    /// Returns true if this type or any of its nested types is Nullable.
-    pub fn is_nullable(&self) -> bool {
-        match self {
-            ClickHouseType::Nullable(_) => true,
-            ClickHouseType::LowCardinality(inner) => inner.is_nullable(),
-            _ => false,
-        }
-    }
-
-    /// Returns the innermost base type, unwrapping all modifiers.
-    /// For example: LowCardinality(Nullable(String)) -> Primitive("String")
-    pub fn base_type(&self) -> &ClickHouseType<'a> {
-        match self {
-            ClickHouseType::Nullable(inner) | ClickHouseType::LowCardinality(inner) => {
-                inner.base_type()
-            }
-            _ => self,
-        }
-    }
-}
-
-/// Parses a ClickHouse type string into a structured representation.
-pub fn parse_ch_type(ty: &str) -> ClickHouseType<'_> {
-    let ty = ty.trim();
-
-    // Recursively strip and parse type modifiers
-    if let Some(inner) = strip_wrapper(ty, "Nullable") {
-        return ClickHouseType::Nullable(Box::new(parse_ch_type(inner)));
-    }
-    if let Some(inner) = strip_wrapper(ty, "LowCardinality") {
-        return ClickHouseType::LowCardinality(Box::new(parse_ch_type(inner)));
-    }
-
-    // Base case: return primitive type for anything without modifiers
-    ClickHouseType::Primitive(ty)
-}
-
-/// Helper function to strip a wrapper from a type string.
-/// Returns the inner content if the type matches the wrapper pattern.
-fn strip_wrapper<'a>(ty: &'a str, wrapper_name: &str) -> Option<&'a str> {
-    ty.strip_prefix(wrapper_name)?
-        .trim_start()
-        .strip_prefix('(')?
-        .strip_suffix(')')
-}
-
-/// Unwraps ClickHouse type modifiers like Nullable() and LowCardinality().
-/// Returns a tuple of (base_type, is_nullable).
-/// For example: "LowCardinality(Nullable(String))" -> ("String", true)
-pub fn unwrap_type_modifiers(ch_type: &str) -> (&str, bool) {
-    let parsed = parse_ch_type(ch_type);
-    let is_nullable = parsed.is_nullable();
-
-    match parsed.base_type() {
-        ClickHouseType::Primitive(base) => (base, is_nullable),
-        _ => (ch_type, is_nullable),
-    }
-}
+use crate::sinks::clickhouse::type_parser::{
+    extract_type_name, parse_type_args, precision, unwrap_modifiers,
+};
 
 fn unsupported(ch_type: &str, kind: &str) -> String {
     format!(
@@ -88,8 +16,8 @@ fn unsupported(ch_type: &str, kind: &str) -> String {
 /// Converts a ClickHouse type string to an Arrow DataType.
 /// Returns a tuple of (DataType, is_nullable).
 pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), String> {
-    let (base_type, is_nullable) = unwrap_type_modifiers(ch_type);
-    let (type_name, _) = extract_identifier(base_type);
+    let (base_type, is_nullable) = unwrap_modifiers(ch_type);
+    let (type_name, _) = extract_type_name(base_type);
 
     let data_type = match type_name {
         // Numeric
@@ -133,63 +61,6 @@ pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), Strin
     Ok((data_type, is_nullable))
 }
 
-/// Extracts an identifier from the start of a string.
-/// Returns (identifier, remaining_string).
-fn extract_identifier(input: &str) -> (&str, &str) {
-    for (i, c) in input.char_indices() {
-        if c.is_alphabetic() || c == '_' || (i > 0 && c.is_numeric()) {
-            continue;
-        }
-        return (&input[..i], &input[i..]);
-    }
-    (input, "")
-}
-
-/// Parses comma-separated arguments from a parenthesized string.
-/// Input: "(arg1, arg2, arg3)" -> Output: Ok(vec!["arg1".to_string(), "arg2".to_string(), "arg3".to_string()])
-/// Returns an error if parentheses are malformed.
-fn parse_args(input: &str) -> Result<Vec<String>, String> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-        return Err(format!(
-            "Expected parentheses around arguments in '{}'",
-            input
-        ));
-    }
-
-    let inner = trimmed[1..trimmed.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Split by comma, handling nested parentheses and quotes
-    let mut args = Vec::new();
-    let mut current_arg = String::new();
-    let mut depth = 0;
-    let mut in_quotes = false;
-
-    for c in inner.chars() {
-        match c {
-            '\'' if !in_quotes => in_quotes = true,
-            '\'' if in_quotes => in_quotes = false,
-            '(' if !in_quotes => depth += 1,
-            ')' if !in_quotes => depth -= 1,
-            ',' if depth == 0 && !in_quotes => {
-                args.push(current_arg.trim().to_string());
-                current_arg = String::new();
-                continue;
-            }
-            _ => {}
-        }
-        current_arg.push(c);
-    }
-
-    if !current_arg.trim().is_empty() {
-        args.push(current_arg.trim().to_string());
-    }
-
-    Ok(args)
-}
 
 /// Parses ClickHouse Decimal types and returns the appropriate Arrow decimal type.
 /// ClickHouse formats:
@@ -202,31 +73,31 @@ fn parse_args(input: &str) -> Result<Vec<String>, String> {
 /// Uses metadata from ClickHouse's system.columns when available, otherwise falls back to parsing the type string.
 fn parse_decimal_type(ch_type: &str) -> Result<DataType, String> {
     // Parse from type string
-    let (type_name, args_str) = extract_identifier(ch_type);
+    let (type_name, args_str) = extract_type_name(ch_type);
 
-    let result = parse_args(args_str).ok().and_then(|args| match type_name {
+    let result = parse_type_args(args_str).ok().and_then(|args| match type_name {
         "Decimal" if args.len() == 2 => args[0].parse::<u8>().ok().zip(args[1].parse::<i8>().ok()),
         "Decimal32" | "Decimal64" | "Decimal128" | "Decimal256" if args.len() == 1 => {
             args[0].parse::<i8>().ok().map(|scale| {
-                let precision = match type_name {
-                    "Decimal32" => DECIMAL32_PRECISION,
-                    "Decimal64" => DECIMAL64_PRECISION,
-                    "Decimal128" => DECIMAL128_PRECISION,
-                    "Decimal256" => DECIMAL256_PRECISION,
+                let prec = match type_name {
+                    "Decimal32" => precision::DECIMAL32,
+                    "Decimal64" => precision::DECIMAL64,
+                    "Decimal128" => precision::DECIMAL128,
+                    "Decimal256" => precision::DECIMAL256,
                     _ => unreachable!(),
                 };
-                (precision, scale)
+                (prec, scale)
             })
         }
         _ => None,
     });
 
     result
-        .map(|(precision, scale)| {
-            if precision <= DECIMAL128_PRECISION {
-                DataType::Decimal128(precision, scale)
+        .map(|(prec, scale)| {
+            if prec <= precision::DECIMAL128 {
+                DataType::Decimal128(prec, scale)
             } else {
-                DataType::Decimal256(precision, scale)
+                DataType::Decimal256(prec, scale)
             }
         })
         .ok_or_else(|| format!("Could not parse Decimal type '{}'.", ch_type))
@@ -240,9 +111,9 @@ fn parse_decimal_type(ch_type: &str) -> Result<DataType, String> {
 ///
 fn parse_datetime64_precision(ch_type: &str) -> Result<DataType, String> {
     // Parse from type string
-    let (_type_name, args_str) = extract_identifier(ch_type);
+    let (_type_name, args_str) = extract_type_name(ch_type);
 
-    let args = parse_args(args_str).map_err(|e| {
+    let args = parse_type_args(args_str).map_err(|e| {
         format!(
             "Could not parse DateTime64 arguments from '{}': {}. Expected format: DateTime64(0-9) or DateTime64(0-9, 'timezone')",
             ch_type, e
@@ -488,67 +359,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_extract_identifier() {
-        assert_eq!(extract_identifier("Decimal(10, 2)"), ("Decimal", "(10, 2)"));
-        assert_eq!(extract_identifier("DateTime64(3)"), ("DateTime64", "(3)"));
-        assert_eq!(extract_identifier("Int32"), ("Int32", ""));
-        assert_eq!(
-            extract_identifier("LowCardinality(String)"),
-            ("LowCardinality", "(String)")
-        );
-        assert_eq!(extract_identifier("Decimal128(10)"), ("Decimal128", "(10)"));
-    }
-
-    #[test]
-    fn test_parse_args() {
-        // Simple cases
-        assert_eq!(
-            parse_args("(10, 2)").unwrap(),
-            vec!["10".to_string(), "2".to_string()]
-        );
-        assert_eq!(parse_args("(3)").unwrap(), vec!["3".to_string()]);
-        assert_eq!(parse_args("()").unwrap(), Vec::<String>::new());
-
-        // With spaces
-        assert_eq!(
-            parse_args("( 10 , 2 )").unwrap(),
-            vec!["10".to_string(), "2".to_string()]
-        );
-
-        // With nested parentheses
-        assert_eq!(
-            parse_args("(Nullable(String))").unwrap(),
-            vec!["Nullable(String)".to_string()]
-        );
-        assert_eq!(
-            parse_args("(Array(Int32), String)").unwrap(),
-            vec!["Array(Int32)".to_string(), "String".to_string()]
-        );
-
-        // With quotes
-        assert_eq!(
-            parse_args("(3, 'UTC')").unwrap(),
-            vec!["3".to_string(), "'UTC'".to_string()]
-        );
-        assert_eq!(
-            parse_args("(9, 'America/New_York')").unwrap(),
-            vec!["9".to_string(), "'America/New_York'".to_string()]
-        );
-
-        // Complex nested case
-        assert_eq!(
-            parse_args("(Tuple(Int32, String), Array(Float64))").unwrap(),
-            vec![
-                "Tuple(Int32, String)".to_string(),
-                "Array(Float64)".to_string()
-            ]
-        );
-
-        // Error cases
-        assert!(parse_args("10, 2").is_err()); // Missing parentheses
-        assert!(parse_args("(10, 2").is_err()); // Missing closing paren
-    }
+    // Tests for extract_type_name and parse_type_args are in the type_parser module
 
     #[test]
     fn test_array_type_not_supported() {
@@ -589,59 +400,5 @@ mod tests {
         assert!(err.contains("Unknown ClickHouse type"));
     }
 
-    #[test]
-    fn test_parse_ch_type_primitives() {
-        assert_eq!(parse_ch_type("String"), ClickHouseType::Primitive("String"));
-        assert_eq!(parse_ch_type("Int64"), ClickHouseType::Primitive("Int64"));
-        assert_eq!(
-            parse_ch_type("DateTime64(3)"),
-            ClickHouseType::Primitive("DateTime64(3)")
-        );
-    }
-
-    #[test]
-    fn test_parse_ch_type_nullable() {
-        assert_eq!(
-            parse_ch_type("Nullable(String)"),
-            ClickHouseType::Nullable(Box::new(ClickHouseType::Primitive("String")))
-        );
-        assert_eq!(
-            parse_ch_type("Nullable(Int64)"),
-            ClickHouseType::Nullable(Box::new(ClickHouseType::Primitive("Int64")))
-        );
-    }
-
-    #[test]
-    fn test_parse_ch_type_lowcardinality() {
-        assert_eq!(
-            parse_ch_type("LowCardinality(String)"),
-            ClickHouseType::LowCardinality(Box::new(ClickHouseType::Primitive("String")))
-        );
-        assert_eq!(
-            parse_ch_type("LowCardinality(Nullable(String))"),
-            ClickHouseType::LowCardinality(Box::new(ClickHouseType::Nullable(Box::new(
-                ClickHouseType::Primitive("String")
-            ))))
-        );
-    }
-
-    #[test]
-    fn test_parse_ch_type_is_nullable() {
-        assert!(!parse_ch_type("String").is_nullable());
-        assert!(parse_ch_type("Nullable(String)").is_nullable());
-        assert!(parse_ch_type("LowCardinality(Nullable(String))").is_nullable());
-        assert!(!parse_ch_type("LowCardinality(String)").is_nullable());
-    }
-
-    #[test]
-    fn test_parse_ch_type_base_type() {
-        let parsed = parse_ch_type("LowCardinality(Nullable(String))");
-        assert_eq!(parsed.base_type(), &ClickHouseType::Primitive("String"));
-
-        let parsed = parse_ch_type("Nullable(Int64)");
-        assert_eq!(parsed.base_type(), &ClickHouseType::Primitive("Int64"));
-
-        let parsed = parse_ch_type("String");
-        assert_eq!(parsed.base_type(), &ClickHouseType::Primitive("String"));
-    }
+    // Tests for unwrap_modifiers are in the type_parser module
 }
