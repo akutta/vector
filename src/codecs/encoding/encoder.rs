@@ -1,23 +1,81 @@
 use bytes::BytesMut;
+use dyn_clone::DynClone;
 use tokio_util::codec::Encoder as _;
-#[cfg(feature = "codecs-arrow")]
-use vector_lib::codecs::encoding::ArrowStreamSerializer;
 use vector_lib::codecs::{
     CharacterDelimitedEncoder, NewlineDelimitedEncoder, TextSerializerConfig,
     encoding::{Error, Framer, Serializer},
 };
+
+#[cfg(feature = "codecs-arrow")]
+use vector_lib::codecs::encoding::ArrowStreamSerializer;
 
 use crate::{
     event::Event,
     internal_events::{EncoderFramingError, EncoderSerializeError},
 };
 
+/// Trait for batch serializers that encode multiple events at once.
+///
+/// This trait abstracts over different batch encoding formats (Arrow, RowBinary, etc.)
+/// and provides a unified interface for encoding batches of events.
+pub trait BatchSerializerTrait: DynClone + Send + Sync {
+    /// Encode a batch of events into the provided buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error if the batch cannot be encoded.
+    fn encode_batch(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Error>;
+
+    /// Get the HTTP content type for this serializer.
+    fn content_type(&self) -> &'static str;
+}
+
+dyn_clone::clone_trait_object!(BatchSerializerTrait);
+
+/// Wrapper for batch serializers that implements the trait abstraction.
+///
+/// This allows any type that implements `BatchSerializerTrait` to be used
+/// without explicitly adding it to an enum variant.
+#[derive(Clone)]
+pub struct BatchSerializerWrapper {
+    inner: Box<dyn BatchSerializerTrait>,
+    content_type: &'static str,
+}
+
+impl BatchSerializerWrapper {
+    /// Create a new wrapper from a batch serializer trait implementation.
+    pub fn new<T: BatchSerializerTrait + 'static>(serializer: T) -> Self {
+        let content_type = serializer.content_type();
+        Self {
+            inner: Box::new(serializer),
+            content_type,
+        }
+    }
+}
+
+impl std::fmt::Debug for BatchSerializerWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchSerializerWrapper")
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
+impl BatchSerializerTrait for BatchSerializerWrapper {
+    fn encode_batch(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Error> {
+        self.inner.encode_batch(events, buffer)
+    }
+
+    fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+}
+
 /// Serializers that support batch encoding (encoding all events at once).
 #[derive(Debug, Clone)]
 pub enum BatchSerializer {
-    /// Arrow IPC stream format serializer.
-    #[cfg(feature = "codecs-arrow")]
-    Arrow(ArrowStreamSerializer),
+    /// Generic batch serializer (Arrow, RowBinary, or any other implementation).
+    Batch(BatchSerializerWrapper),
 }
 
 /// An encoder that encodes batches of events.
@@ -38,34 +96,39 @@ impl BatchEncoder {
     }
 
     /// Get the HTTP content type.
-    #[cfg(feature = "codecs-arrow")]
-    pub const fn content_type(&self) -> &'static str {
+    pub fn content_type(&self) -> &'static str {
         match &self.serializer {
-            BatchSerializer::Arrow(_) => "application/vnd.apache.arrow.stream",
+            BatchSerializer::Batch(wrapper) => wrapper.content_type(),
         }
+    }
+}
+
+// Implement BatchSerializerTrait for ArrowStreamSerializer
+#[cfg(feature = "codecs-arrow")]
+impl BatchSerializerTrait for ArrowStreamSerializer {
+    fn encode_batch(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Error> {
+        use vector_lib::codecs::encoding::ArrowEncodingError;
+        tokio_util::codec::Encoder::<Vec<Event>>::encode(self, events, buffer).map_err(|err| {
+            match err {
+                ArrowEncodingError::NullConstraint { .. } => {
+                    Error::SchemaConstraintViolation(Box::new(err))
+                }
+                _ => Error::SerializingError(Box::new(err)),
+            }
+        })
+    }
+
+    fn content_type(&self) -> &'static str {
+        "application/vnd.apache.arrow.stream"
     }
 }
 
 impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
     type Error = Error;
 
-    #[allow(unused_variables)]
     fn encode(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Self::Error> {
-        #[allow(unreachable_patterns)]
         match &mut self.serializer {
-            #[cfg(feature = "codecs-arrow")]
-            BatchSerializer::Arrow(serializer) => {
-                serializer.encode(events, buffer).map_err(|err| {
-                    use vector_lib::codecs::encoding::ArrowEncodingError;
-                    match err {
-                        ArrowEncodingError::NullConstraint { .. } => {
-                            Error::SchemaConstraintViolation(Box::new(err))
-                        }
-                        _ => Error::SerializingError(Box::new(err)),
-                    }
-                })
-            }
-            _ => unreachable!("BatchSerializer cannot be constructed without encode()"),
+            BatchSerializer::Batch(wrapper) => wrapper.encode_batch(events, buffer),
         }
     }
 }
@@ -76,7 +139,7 @@ pub enum EncoderKind {
     /// Uses framing to encode individual events
     Framed(Box<Encoder<Framer>>),
     /// Encodes events in batches without framing
-    #[cfg(feature = "codecs-arrow")]
+    #[cfg(any(feature = "codecs-arrow", feature = "sinks-clickhouse"))]
     Batch(BatchEncoder),
 }
 
