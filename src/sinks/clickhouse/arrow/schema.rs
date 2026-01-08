@@ -1,125 +1,72 @@
 //! Schema fetching and Arrow schema construction for ClickHouse tables.
+//!
+//! This module uses the shared schema fetcher and converts the result to an Arrow schema.
 
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
-use http::{Request, StatusCode};
-use hyper::Body;
-use serde::Deserialize;
+use http::Uri;
 use vector_lib::codecs::encoding::format::{ArrowEncodingError, SchemaProvider};
 
 use crate::http::{Auth, HttpClient};
+use crate::sinks::clickhouse::schema::{SchemaFetcher, TableSchema};
 
 use super::parser::clickhouse_type_to_arrow;
 
-#[derive(Debug, Deserialize)]
-struct ColumnInfo {
-    name: String,
-    #[serde(rename = "type")]
-    column_type: String,
-}
+/// Converts a ClickHouse TableSchema to an Arrow Schema.
+fn table_schema_to_arrow(table_schema: &TableSchema) -> crate::Result<Schema> {
+    let mut fields = Vec::with_capacity(table_schema.column_order.len());
 
-/// URL-encodes a string for use in HTTP query parameters.
-fn url_encode(s: &str) -> String {
-    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
+    for column_name in &table_schema.column_order {
+        let column = table_schema
+            .get_column(column_name)
+            .ok_or_else(|| format!("Column '{}' not found in schema", column_name))?;
 
-/// Fetches the schema for a ClickHouse table and converts it to an Arrow schema.
-pub async fn fetch_table_schema(
-    client: &HttpClient,
-    endpoint: &str,
-    database: &str,
-    table: &str,
-    auth: Option<&Auth>,
-) -> crate::Result<Schema> {
-    let query = "SELECT name, type \
-                 FROM system.columns \
-                 WHERE database = {db:String} AND table = {tbl:String} \
-                 ORDER BY position \
-                 FORMAT JSONEachRow";
-
-    // Build URI with query and parameters
-    let uri = format!(
-        "{}?query={}&param_db={}&param_tbl={}",
-        endpoint,
-        url_encode(query),
-        url_encode(database),
-        url_encode(table)
-    );
-    let mut request = Request::get(&uri).body(Body::empty()).unwrap();
-
-    if let Some(auth) = auth {
-        auth.apply(&mut request);
-    }
-
-    let response = client.send(request).await?;
-
-    match response.status() {
-        StatusCode::OK => {
-            let body_bytes = http_body::Body::collect(response.into_body())
-                .await?
-                .to_bytes();
-            let body_str = String::from_utf8(body_bytes.into())
-                .map_err(|e| format!("Failed to parse response as UTF-8: {}", e))?;
-
-            parse_schema_from_response(&body_str)
-        }
-        status => Err(format!("Failed to fetch schema from ClickHouse: HTTP {}", status).into()),
-    }
-}
-
-/// Parses the JSON response from ClickHouse and builds an Arrow schema.
-fn parse_schema_from_response(response: &str) -> crate::Result<Schema> {
-    let mut columns: Vec<ColumnInfo> = Vec::new();
-
-    for line in response.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let column: ColumnInfo = serde_json::from_str(line)
-            .map_err(|e| format!("Failed to parse column info: {}", e))?;
-        columns.push(column);
-    }
-
-    if columns.is_empty() {
-        return Err("No columns found in table schema".into());
-    }
-
-    let mut fields = Vec::new();
-    for column in columns {
         let (arrow_type, nullable) = clickhouse_type_to_arrow(&column.column_type)
-            .map_err(|e| format!("Failed to convert column '{}': {}", column.name, e))?;
-        fields.push(Field::new(&column.name, arrow_type, nullable));
+            .map_err(|e| format!("Failed to convert column '{}': {}", column_name, e))?;
+
+        fields.push(Field::new(column_name, arrow_type, nullable));
+    }
+
+    if fields.is_empty() {
+        return Err("No columns found in table schema".into());
     }
 
     Ok(Schema::new(fields))
 }
 
 /// Schema provider implementation for ClickHouse tables.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClickHouseSchemaProvider {
-    client: HttpClient,
-    endpoint: String,
+    fetcher: SchemaFetcher,
     database: String,
     table: String,
-    auth: Option<Auth>,
+}
+
+impl std::fmt::Debug for ClickHouseSchemaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSchemaProvider")
+            .field("database", &self.database)
+            .field("table", &self.table)
+            .finish()
+    }
 }
 
 impl ClickHouseSchemaProvider {
     /// Create a new ClickHouse schema provider.
-    pub const fn new(
+    pub fn new(
         client: HttpClient,
         endpoint: String,
         database: String,
         table: String,
         auth: Option<Auth>,
     ) -> Self {
+        let uri: Uri = endpoint.parse().expect("endpoint should be a valid URI");
+        let fetcher = SchemaFetcher::new(client, uri, auth);
+
         Self {
-            client,
-            endpoint,
+            fetcher,
             database,
             table,
-            auth,
         }
     }
 }
@@ -127,15 +74,15 @@ impl ClickHouseSchemaProvider {
 #[async_trait]
 impl SchemaProvider for ClickHouseSchemaProvider {
     async fn get_schema(&self) -> Result<Schema, ArrowEncodingError> {
-        fetch_table_schema(
-            &self.client,
-            &self.endpoint,
-            &self.database,
-            &self.table,
-            self.auth.as_ref(),
-        )
-        .await
-        .map_err(|e| ArrowEncodingError::SchemaFetchError {
+        let table_schema = self
+            .fetcher
+            .fetch_schema(&self.database, &self.table)
+            .await
+            .map_err(|e| ArrowEncodingError::SchemaFetchError {
+                message: e.to_string(),
+            })?;
+
+        table_schema_to_arrow(&table_schema).map_err(|e| ArrowEncodingError::SchemaFetchError {
             message: e.to_string(),
         })
     }
@@ -145,15 +92,45 @@ impl SchemaProvider for ClickHouseSchemaProvider {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, TimeUnit};
+    use std::collections::HashMap;
+
+    use crate::sinks::clickhouse::schema::ColumnInfo;
+
+    fn create_test_schema(columns: Vec<(&str, &str)>) -> TableSchema {
+        let mut schema_columns = HashMap::new();
+        let mut column_order = Vec::new();
+
+        for (name, col_type) in columns {
+            let is_nullable = col_type.starts_with("Nullable(") || col_type.contains("Nullable(");
+            schema_columns.insert(
+                name.to_string(),
+                ColumnInfo {
+                    name: name.to_string(),
+                    column_type: col_type.to_string(),
+                    default_expression: None,
+                    is_nullable,
+                },
+            );
+            column_order.push(name.to_string());
+        }
+
+        TableSchema {
+            database: "test".to_string(),
+            table: "test_table".to_string(),
+            columns: schema_columns,
+            column_order,
+        }
+    }
 
     #[test]
-    fn test_parse_schema() {
-        let response = r#"{"name":"id","type":"Int64"}
-{"name":"message","type":"String"}
-{"name":"timestamp","type":"DateTime"}
-"#;
+    fn test_table_schema_to_arrow() {
+        let table_schema = create_test_schema(vec![
+            ("id", "Int64"),
+            ("message", "String"),
+            ("timestamp", "DateTime"),
+        ]);
 
-        let schema = parse_schema_from_response(response).unwrap();
+        let schema = table_schema_to_arrow(&table_schema).unwrap();
         assert_eq!(schema.fields().len(), 3);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
@@ -167,14 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_schema_with_type_parameters() {
-        // Test that type string parsing works for types with parameters
-        let response = r#"{"name":"bytes_sent","type":"Decimal(18, 2)"}
-{"name":"timestamp","type":"DateTime64(6)"}
-{"name":"duration_ms","type":"Decimal32(4)"}
-"#;
+    fn test_table_schema_to_arrow_with_type_parameters() {
+        let table_schema = create_test_schema(vec![
+            ("bytes_sent", "Decimal(18, 2)"),
+            ("timestamp", "DateTime64(6)"),
+            ("duration_ms", "Decimal32(4)"),
+        ]);
 
-        let schema = parse_schema_from_response(response).unwrap();
+        let schema = table_schema_to_arrow(&table_schema).unwrap();
         assert_eq!(schema.fields().len(), 3);
 
         // Check Decimal parsed from type string
@@ -195,16 +172,17 @@ mod tests {
 
     #[test]
     fn test_schema_field_ordering() {
-        let response = r#"{"name":"timestamp","type":"DateTime64(3)"}
-{"name":"host","type":"String"}
-{"name":"message","type":"String"}
-{"name":"id","type":"Int64"}
-{"name":"score","type":"Float64"}
-{"name":"active","type":"Bool"}
-{"name":"name","type":"String"}
-"#;
+        let table_schema = create_test_schema(vec![
+            ("timestamp", "DateTime64(3)"),
+            ("host", "String"),
+            ("message", "String"),
+            ("id", "Int64"),
+            ("score", "Float64"),
+            ("active", "Bool"),
+            ("name", "String"),
+        ]);
 
-        let schema = parse_schema_from_response(response).unwrap();
+        let schema = table_schema_to_arrow(&table_schema).unwrap();
         assert_eq!(schema.fields().len(), 7);
 
         assert_eq!(schema.field(0).name(), "timestamp");
