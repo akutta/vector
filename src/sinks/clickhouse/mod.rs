@@ -3,9 +3,16 @@
 //! This module contains the [`vector_lib::sink::VectorSink`] instance that is responsible for
 //! taking a stream of [`vector_lib::event::Event`] instances and forwarding them to Clickhouse.
 //!
-//! Events are sent to Clickhouse using the HTTP interface with a query of the following structure:
-//! `INSERT INTO my_db.my_table FORMAT JSONEachRow`. The event payload is encoded as new-line
-//! delimited JSON.
+//! ## Formats
+//!
+//! Events can be sent to ClickHouse using different formats:
+//!
+//! - **JSON formats** (`JSONEachRow`, `JSONAsObject`, `JSONAsString`): Events are encoded as
+//!   newline-delimited JSON and sent via HTTP POST.
+//!
+//! - **Binary formats** (`RowBinaryWithNamesAndTypes`): Events are encoded in ClickHouse's
+//!   efficient binary format. This requires a `schema` configuration to map event fields to
+//!   table columns. The table schema is fetched from ClickHouse at startup.
 //!
 //! This sink only supports logs for now but could support metrics and traces as well in the future.
 
@@ -14,5 +21,7 @@ pub mod config;
 #[cfg(all(test, feature = "clickhouse-integration-tests"))]
 mod integration_tests;
 mod request_builder;
+pub mod rowbinary;
+pub mod schema;
 mod service;
 mod sink;

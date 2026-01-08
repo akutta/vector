@@ -1,7 +1,8 @@
 //! Configuration for the `Clickhouse` sink.
 
-use std::fmt;
+use std::{collections::HashMap, fmt, sync::Arc};
 
+use crate::codecs::Encoder;
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
 use vector_lib::codecs::encoding::format::SchemaProvider;
@@ -9,6 +10,7 @@ use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerC
 
 use super::{
     request_builder::ClickhouseRequestBuilder,
+    rowbinary::{RowBinaryEncoder, RowBinarySerializer, SchemaFetcher},
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
     sink::{ClickhouseSink, PartitionKey},
 };
@@ -44,6 +46,23 @@ pub enum Format {
     /// ArrowStream (beta).
     #[configurable(metadata(status = "beta"))]
     ArrowStream,
+
+    /// RowBinaryWithNamesAndTypes (beta).
+    #[configurable(metadata(status = "beta"))]
+    RowBinaryWithNamesAndTypes,
+}
+
+impl Format {
+    pub const fn is_binary(&self) -> bool {
+        matches!(self, Format::RowBinaryWithNamesAndTypes)
+    }
+
+    pub const fn is_json(&self) -> bool {
+        matches!(
+            self,
+            Format::JsonEachRow | Format::JsonAsObject | Format::JsonAsString
+        )
+    }
 }
 
 impl fmt::Display for Format {
@@ -53,8 +72,62 @@ impl fmt::Display for Format {
             Format::JsonAsObject => write!(f, "JSONAsObject"),
             Format::JsonAsString => write!(f, "JSONAsString"),
             Format::ArrowStream => write!(f, "ArrowStream"),
+            Format::RowBinaryWithNamesAndTypes => write!(f, "RowBinaryWithNamesAndTypes"),
         }
     }
+}
+
+/// Behavior when an event field specified in the schema mapping is missing.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMissingField {
+    /// Use the default value for the column type.
+    #[default]
+    UseDefault,
+
+    /// Drop the entire event.
+    DropEvent,
+
+    /// Insert NULL (only valid for Nullable columns).
+    InsertNull,
+}
+
+/// Schema configuration for binary formats.
+///
+/// When using `RowBinaryWithNamesAndTypes` format, the schema is fetched from the
+/// ClickHouse table at startup. Event fields are automatically mapped to table columns
+/// by matching the column name to the event field path (e.g., column "host" maps to ".host").
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaConfig {
+    /// List of table columns that must exist.
+    ///
+    /// If any of these columns are not found in the table schema at startup, the sink will fail to initialize.
+    /// This provides early validation that the expected schema exists.
+    #[configurable(metadata(
+        docs::examples = "timestamp",
+        docs::examples = "host",
+        docs::examples = "message"
+    ))]
+    #[serde(default)]
+    pub required_columns: Vec<String>,
+
+    /// Behavior when an event field for a column is missing.
+    #[serde(default)]
+    pub on_missing_field: OnMissingField,
+
+    /// Default values to use when event fields are missing.
+    ///
+    /// The key is the column name, and the value is the default value as a string.
+    /// The value will be converted to the column's type.
+    #[configurable(metadata(
+        docs::examples = "severity = \"info\"",
+        docs::examples = "status_code = \"0\""
+    ))]
+    #[serde(default)]
+    pub defaults: HashMap<String, String>,
 }
 
 /// Configuration for the `clickhouse` sink.
@@ -78,6 +151,11 @@ pub struct ClickhouseConfig {
     /// The format to parse input data.
     #[serde(default)]
     pub format: Format,
+
+    /// Schema configuration for binary formats.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub schema: Option<SchemaConfig>,
 
     /// Sets `input_format_skip_unknown_fields`, allowing ClickHouse to discard fields not present in the table schema.
     ///
@@ -194,14 +272,64 @@ impl_generate_config_from_default!(ClickhouseConfig);
 #[typetag::serde(name = "clickhouse")]
 impl SinkConfig for ClickhouseConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Validate configuration based on format
+        self.validate_config()?;
+
         let endpoint = self.endpoint.with_default_parts().uri;
-
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
-
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
 
+        let database = self.database.clone().unwrap_or_else(|| {
+            "default"
+                .try_into()
+                .expect("'default' should be a valid template")
+        });
+
+        // Build sink based on format
+        match self.format {
+            Format::JsonEachRow | Format::JsonAsObject | Format::JsonAsString | Format::ArrowStream => {
+                self.build_json_sink(cx, client, endpoint, auth, database)
+                    .await
+            }
+            Format::RowBinaryWithNamesAndTypes => {
+                self.build_binary_sink(cx, client, endpoint, auth, database)
+                    .await
+            }
+        }
+    }
+
+    fn input(&self) -> Input {
+        Input::log()
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+impl ClickhouseConfig {
+    /// Validates the configuration based on the selected format.
+    fn validate_config(&self) -> crate::Result<()> {
+        if self.format.is_binary() {
+            // Binary formats require schema configuration
+            let _schema = self.schema.as_ref().ok_or(
+                "schema configuration is required for binary format 'row_binary_with_names_and_types'. \
+                 Please provide a 'schema' section."
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Builds the sink for JSON formats (existing behavior).
+    async fn build_json_sink(
+        &self,
+        _cx: SinkContext,
+        client: HttpClient,
+        endpoint: Uri,
+        auth: Option<Auth>,
+        database: Template,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
         let clickhouse_service_request_builder = ClickhouseServiceRequestBuilder {
             auth: auth.clone(),
             endpoint: endpoint.clone(),
@@ -210,6 +338,8 @@ impl SinkConfig for ClickhouseConfig {
             insert_random_shard: self.insert_random_shard,
             compression: self.compression,
             query_settings: self.query_settings,
+            // JSON formats handle JSON natively, no special setting needed
+            has_json_columns: false,
         };
 
         let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
@@ -222,12 +352,6 @@ impl SinkConfig for ClickhouseConfig {
             .service(service);
 
         let batch_settings = self.batch.into_batcher_settings()?;
-
-        let database = self.database.clone().unwrap_or_else(|| {
-            "default"
-                .try_into()
-                .expect("'default' should be a valid template")
-        });
 
         // Resolve the encoding strategy (format + encoder) based on configuration
         let (format, encoder_kind) = self
@@ -253,12 +377,112 @@ impl SinkConfig for ClickhouseConfig {
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
-    fn input(&self) -> Input {
-        Input::log()
-    }
+    /// Builds the sink for binary formats (RowBinaryWithNamesAndTypes).
+    async fn build_binary_sink(
+        &self,
+        _cx: SinkContext,
+        client: HttpClient,
+        endpoint: Uri,
+        auth: Option<Auth>,
+        database: Template,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Get schema configuration
+        let schema_config = self.schema.as_ref().ok_or(
+            "schema configuration is required for binary format 'row_binary_with_names_and_types'"
+        )?;
 
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
+        // For binary format, we need to know the table name at build time to fetch the schema.
+        // If the table is templated, we can't fetch the schema ahead of time.
+        let table_str = self.table.get_ref();
+        if table_str.contains("{{") || table_str.contains("{%") {
+            return Err(
+                "Templated table names are not supported with binary format. \
+                 Use a static table name or switch to a JSON format."
+                    .into(),
+            );
+        }
+
+        // Similarly for database
+        let database_str = database.get_ref();
+        if database_str.contains("{{") || database_str.contains("{%") {
+            return Err(
+                "Templated database names are not supported with binary format. \
+                 Use a static database name or switch to a JSON format."
+                    .into(),
+            );
+        }
+
+        // Fetch table schema from ClickHouse
+        let schema_fetcher = SchemaFetcher::new(client.clone(), endpoint.clone(), auth.clone());
+        let table_schema = schema_fetcher
+            .fetch_schema(database_str, table_str)
+            .await
+            .map_err(|e| format!("Failed to fetch table schema: {}", e))?;
+
+        // Validate required columns exist in the table schema
+        table_schema
+            .validate_required_columns(&schema_config.required_columns)
+            .map_err(|e| format!("Schema validation failed: {}", e))?;
+
+        // Create the RowBinary encoder
+        let encoder = RowBinaryEncoder::new(&table_schema, schema_config)
+            .map_err(|e| format!("Failed to create RowBinary encoder: {}", e))?;
+
+        let encoder = Arc::new(encoder);
+
+        // Create RowBinary serializer
+        let table_schema_arc = Arc::new(table_schema);
+        let serializer = RowBinarySerializer::new(Arc::clone(&table_schema_arc), schema_config)
+            .map_err(|e| format!("Failed to create RowBinary serializer: {}", e))?;
+
+        // Create service
+        let clickhouse_service_request_builder = ClickhouseServiceRequestBuilder {
+            auth: auth.clone(),
+            endpoint: endpoint.clone(),
+            skip_unknown_fields: self.skip_unknown_fields,
+            date_time_best_effort: self.date_time_best_effort,
+            insert_random_shard: self.insert_random_shard,
+            compression: self.compression,
+            query_settings: self.query_settings,
+            has_json_columns: encoder.has_json_columns(),
+        };
+
+        let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
+            HttpService::new(client.clone(), clickhouse_service_request_builder);
+
+        let request_limits = self.request.into_settings();
+
+        let service = ServiceBuilder::new()
+            .settings(request_limits, ClickhouseRetryLogic::default())
+            .service(service);
+
+        let batch_settings = self.batch.into_batcher_settings()?;
+
+        // Create the request builder using BatchEncoder with RowBinarySerializer
+        let batch_serializer = crate::codecs::BatchSerializerWrapper::new(serializer);
+        let batch_encoder = crate::codecs::BatchEncoder::new(
+            crate::codecs::BatchSerializer::Batch(batch_serializer),
+        );
+        let request_builder = ClickhouseRequestBuilder {
+            compression: self.compression,
+            encoder: (
+                self.encoding.clone(),
+                crate::codecs::EncoderKind::Batch(batch_encoder),
+            ),
+        };
+
+        let sink = ClickhouseSink::new(
+            batch_settings,
+            service,
+            database,
+            self.table.clone(),
+            self.format,
+            request_builder,
+        );
+
+        let healthcheck = Box::pin(healthcheck(client, endpoint, auth));
+
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 }
 
@@ -306,7 +530,7 @@ impl ClickhouseConfig {
 
             let resolved_batch_config = BatchSerializerConfig::ArrowStream(arrow_config);
             let arrow_serializer = resolved_batch_config.build()?;
-            let batch_serializer = BatchSerializer::Arrow(arrow_serializer);
+            let batch_serializer = BatchSerializer::Batch(crate::codecs::BatchSerializerWrapper::new(arrow_serializer));
             let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
 
             return Ok((Format::ArrowStream, encoder));
