@@ -268,7 +268,10 @@ impl SinkConfig for ClickhouseConfig {
 
         // Build sink based on format
         match self.format {
-            Format::JsonEachRow | Format::JsonAsObject | Format::JsonAsString | Format::ArrowStream => {
+            Format::JsonEachRow
+            | Format::JsonAsObject
+            | Format::JsonAsString
+            | Format::ArrowStream => {
                 self.build_json_sink(cx, client, endpoint, auth, database)
                     .await
             }
@@ -368,7 +371,7 @@ impl ClickhouseConfig {
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         // Get schema configuration
         let schema_config = self.schema.as_ref().ok_or(
-            "schema configuration is required for binary format 'row_binary_with_names_and_types'"
+            "schema configuration is required for binary format 'row_binary_with_names_and_types'",
         )?;
 
         // For binary format, we need to know the table name at build time to fetch the schema.
@@ -497,7 +500,9 @@ impl ClickhouseConfig {
 
             let resolved_batch_config = BatchSerializerConfig::ArrowStream(arrow_config);
             let arrow_serializer = resolved_batch_config.build()?;
-            let batch_serializer = BatchSerializer::Batch(crate::codecs::BatchSerializerWrapper::new(arrow_serializer));
+            let batch_serializer = BatchSerializer::Batch(
+                crate::codecs::BatchSerializerWrapper::new(arrow_serializer),
+            );
             let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
 
             return Ok((Format::ArrowStream, encoder));

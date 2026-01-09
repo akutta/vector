@@ -186,8 +186,8 @@ fn set_uri_query(
         uri.push('/');
     }
 
-    uri.push_str("?");
-    
+    uri.push('?');
+
     if format.is_json() {
         uri.push_str("input_format_import_nested_json=1&");
         append_param_bool(&mut uri, "input_format_skip_unknown_fields", skip_unknown);
@@ -196,11 +196,11 @@ fn set_uri_query(
     if date_time_best_effort && format.is_json() {
         uri.push_str("date_time_input_format=best_effort&")
     }
-    
+
     if format.is_binary() && has_json_columns {
         uri.push_str("input_format_binary_read_json_as_string=1&")
     }
-    
+
     if insert_random_shard {
         uri.push_str("insert_distributed_one_random_shard=1&")
     }
@@ -413,7 +413,7 @@ mod tests {
             "URI should NOT contain date_time_input_format for binary format"
         );
     }
-    
+
     #[test]
     fn encode_binary_format_no_json_params() {
         // Test that binary format does NOT include JSON-specific parameters

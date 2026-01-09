@@ -66,8 +66,14 @@ mod tests {
 
     #[test]
     fn test_parse_simple_types() {
-        assert_eq!(ClickHouseType::parse("Int64").unwrap(), ClickHouseType::Int64);
-        assert_eq!(ClickHouseType::parse("String").unwrap(), ClickHouseType::String);
+        assert_eq!(
+            ClickHouseType::parse("Int64").unwrap(),
+            ClickHouseType::Int64
+        );
+        assert_eq!(
+            ClickHouseType::parse("String").unwrap(),
+            ClickHouseType::String
+        );
     }
 
     #[test]
@@ -89,7 +95,10 @@ mod tests {
     #[test]
     fn test_default_values() {
         assert_eq!(ClickHouseType::Int64.default_value(), Value::Integer(0));
-        assert_eq!(ClickHouseType::String.default_value(), Value::Bytes(Bytes::from("")));
+        assert_eq!(
+            ClickHouseType::String.default_value(),
+            Value::Bytes(Bytes::from(""))
+        );
         assert_eq!(ClickHouseType::Bool.default_value(), Value::Boolean(false));
     }
 }

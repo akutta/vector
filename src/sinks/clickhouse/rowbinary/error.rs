@@ -38,9 +38,13 @@ impl From<std::io::Error> for RowBinaryError {
 impl From<TypeParseError> for RowBinaryError {
     fn from(e: TypeParseError) -> Self {
         match e {
-            TypeParseError::UnsupportedType { type_name } => RowBinaryError::UnsupportedType { type_name },
+            TypeParseError::UnsupportedType { type_name } => {
+                RowBinaryError::UnsupportedType { type_name }
+            }
             TypeParseError::InvalidSpec { spec } => RowBinaryError::InvalidTypeSpec { spec },
-            TypeParseError::MalformedArguments { input } => RowBinaryError::InvalidTypeSpec { spec: input },
+            TypeParseError::MalformedArguments { input } => {
+                RowBinaryError::InvalidTypeSpec { spec: input }
+            }
         }
     }
 }

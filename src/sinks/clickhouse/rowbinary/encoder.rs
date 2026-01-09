@@ -158,10 +158,10 @@ impl RowBinaryEncoder {
     /// Get the value for a column from a log event.
     fn get_column_value(&self, log: &LogEvent, col_idx: usize) -> Result<Value, RowBinaryError> {
         // First, try to get the value from the event
-        if let Some(Some(parsed_path)) = self.column_field_paths.get(col_idx) {
-            if let Some(value) = log.get(parsed_path) {
-                return Ok(value.clone());
-            }
+        if let Some(Some(parsed_path)) = self.column_field_paths.get(col_idx)
+            && let Some(value) = log.get(parsed_path)
+        {
+            return Ok(value.clone());
         }
 
         // Value is missing - check for configured default first
@@ -188,9 +188,8 @@ impl RowBinaryEncoder {
     /// Encode multiple events, returning the complete binary payload.
     pub fn encode_batch(&self, events: &[Event]) -> Result<Bytes, RowBinaryError> {
         let estimated_row_size = 100;
-        let mut buffer = Vec::with_capacity(
-            self.header_bytes.len() + (estimated_row_size * events.len())
-        );
+        let mut buffer =
+            Vec::with_capacity(self.header_bytes.len() + (estimated_row_size * events.len()));
 
         buffer.extend_from_slice(&self.header_bytes);
 

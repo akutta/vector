@@ -240,4 +240,3 @@ mod tests {
         assert!(!required_col.can_be_omitted());
     }
 }
-

@@ -52,29 +52,47 @@ impl ClickHouseType {
             }
 
             // Decimals
-            ClickHouseType::Decimal { precision: p, scale } => {
-                Ok(if *p <= precision::DECIMAL128 {
-                    DataType::Decimal128(*p, *scale as i8)
-                } else {
-                    DataType::Decimal256(*p, *scale as i8)
-                })
+            ClickHouseType::Decimal {
+                precision: p,
+                scale,
+            } => Ok(if *p <= precision::DECIMAL128 {
+                DataType::Decimal128(*p, *scale as i8)
+            } else {
+                DataType::Decimal256(*p, *scale as i8)
+            }),
+            ClickHouseType::Decimal32 { scale } => {
+                Ok(DataType::Decimal128(precision::DECIMAL32, *scale as i8))
             }
-            ClickHouseType::Decimal32 { scale } => Ok(DataType::Decimal128(precision::DECIMAL32, *scale as i8)),
-            ClickHouseType::Decimal64 { scale } => Ok(DataType::Decimal128(precision::DECIMAL64, *scale as i8)),
-            ClickHouseType::Decimal128 { scale } => Ok(DataType::Decimal128(precision::DECIMAL128, *scale as i8)),
-            ClickHouseType::Decimal256 { scale } => Ok(DataType::Decimal256(precision::DECIMAL256, *scale as i8)),
+            ClickHouseType::Decimal64 { scale } => {
+                Ok(DataType::Decimal128(precision::DECIMAL64, *scale as i8))
+            }
+            ClickHouseType::Decimal128 { scale } => {
+                Ok(DataType::Decimal128(precision::DECIMAL128, *scale as i8))
+            }
+            ClickHouseType::Decimal256 { scale } => {
+                Ok(DataType::Decimal256(precision::DECIMAL256, *scale as i8))
+            }
 
             // Unsupported complex types
-            ClickHouseType::Array(_) => Err("Array type is not supported for Arrow conversion".to_string()),
-            ClickHouseType::Tuple(_) => Err("Tuple type is not supported for Arrow conversion".to_string()),
-            ClickHouseType::Map { .. } => Err("Map type is not supported for Arrow conversion".to_string()),
+            ClickHouseType::Array(_) => {
+                Err("Array type is not supported for Arrow conversion".to_string())
+            }
+            ClickHouseType::Tuple(_) => {
+                Err("Tuple type is not supported for Arrow conversion".to_string())
+            }
+            ClickHouseType::Map { .. } => {
+                Err("Map type is not supported for Arrow conversion".to_string())
+            }
 
             // Wrappers (should be unwrapped before calling)
             ClickHouseType::Nullable(inner) => inner.to_arrow_type(),
             ClickHouseType::LowCardinality(inner) => inner.to_arrow_type(),
 
             // Other unsupported types
-            _ => Err(format!("Type {:?} is not supported for Arrow conversion", self)),
+            _ => Err(format!(
+                "Type {:?} is not supported for Arrow conversion",
+                self
+            )),
         }
     }
 }
@@ -85,36 +103,78 @@ mod tests {
 
     #[test]
     fn test_clickhouse_type_mapping() {
-        assert_eq!(clickhouse_type_to_arrow("String").unwrap(), (DataType::Utf8, false));
-        assert_eq!(clickhouse_type_to_arrow("Int64").unwrap(), (DataType::Int64, false));
-        assert_eq!(clickhouse_type_to_arrow("Bool").unwrap(), (DataType::Boolean, false));
+        assert_eq!(
+            clickhouse_type_to_arrow("String").unwrap(),
+            (DataType::Utf8, false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("Int64").unwrap(),
+            (DataType::Int64, false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("Bool").unwrap(),
+            (DataType::Boolean, false)
+        );
     }
 
     #[test]
     fn test_datetime64_precision_mapping() {
-        assert_eq!(clickhouse_type_to_arrow("DateTime64(0)").unwrap(), (DataType::Timestamp(TimeUnit::Second, None), false));
-        assert_eq!(clickhouse_type_to_arrow("DateTime64(3)").unwrap(), (DataType::Timestamp(TimeUnit::Millisecond, None), false));
-        assert_eq!(clickhouse_type_to_arrow("DateTime64(6)").unwrap(), (DataType::Timestamp(TimeUnit::Microsecond, None), false));
-        assert_eq!(clickhouse_type_to_arrow("DateTime64(9)").unwrap(), (DataType::Timestamp(TimeUnit::Nanosecond, None), false));
+        assert_eq!(
+            clickhouse_type_to_arrow("DateTime64(0)").unwrap(),
+            (DataType::Timestamp(TimeUnit::Second, None), false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("DateTime64(3)").unwrap(),
+            (DataType::Timestamp(TimeUnit::Millisecond, None), false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("DateTime64(6)").unwrap(),
+            (DataType::Timestamp(TimeUnit::Microsecond, None), false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("DateTime64(9)").unwrap(),
+            (DataType::Timestamp(TimeUnit::Nanosecond, None), false)
+        );
     }
 
     #[test]
     fn test_nullable_type_mapping() {
-        assert_eq!(clickhouse_type_to_arrow("Nullable(String)").unwrap(), (DataType::Utf8, true));
-        assert_eq!(clickhouse_type_to_arrow("Nullable(Int64)").unwrap(), (DataType::Int64, true));
+        assert_eq!(
+            clickhouse_type_to_arrow("Nullable(String)").unwrap(),
+            (DataType::Utf8, true)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("Nullable(Int64)").unwrap(),
+            (DataType::Int64, true)
+        );
     }
 
     #[test]
     fn test_lowcardinality_type_mapping() {
-        assert_eq!(clickhouse_type_to_arrow("LowCardinality(String)").unwrap(), (DataType::Utf8, false));
-        assert_eq!(clickhouse_type_to_arrow("LowCardinality(Nullable(String))").unwrap(), (DataType::Utf8, true));
+        assert_eq!(
+            clickhouse_type_to_arrow("LowCardinality(String)").unwrap(),
+            (DataType::Utf8, false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("LowCardinality(Nullable(String))").unwrap(),
+            (DataType::Utf8, true)
+        );
     }
 
     #[test]
     fn test_decimal_type_mapping() {
-        assert_eq!(clickhouse_type_to_arrow("Decimal(10, 2)").unwrap(), (DataType::Decimal128(10, 2), false));
-        assert_eq!(clickhouse_type_to_arrow("Decimal32(4)").unwrap(), (DataType::Decimal128(9, 4), false));
-        assert_eq!(clickhouse_type_to_arrow("Decimal256(20)").unwrap(), (DataType::Decimal256(76, 20), false));
+        assert_eq!(
+            clickhouse_type_to_arrow("Decimal(10, 2)").unwrap(),
+            (DataType::Decimal128(10, 2), false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("Decimal32(4)").unwrap(),
+            (DataType::Decimal128(9, 4), false)
+        );
+        assert_eq!(
+            clickhouse_type_to_arrow("Decimal256(20)").unwrap(),
+            (DataType::Decimal256(76, 20), false)
+        );
     }
 
     #[test]

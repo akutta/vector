@@ -72,7 +72,10 @@ pub enum ClickHouseType {
     Date,
     Date32,
     DateTime,
-    DateTime64 { precision: u8, timezone: Option<String> },
+    DateTime64 {
+        precision: u8,
+        timezone: Option<String>,
+    },
 
     // UUID
     UUID,
@@ -82,11 +85,22 @@ pub enum ClickHouseType {
     IPv6,
 
     // Decimal types
-    Decimal { precision: u8, scale: u8 },
-    Decimal32 { scale: u8 },
-    Decimal64 { scale: u8 },
-    Decimal128 { scale: u8 },
-    Decimal256 { scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
+    Decimal32 {
+        scale: u8,
+    },
+    Decimal64 {
+        scale: u8,
+    },
+    Decimal128 {
+        scale: u8,
+    },
+    Decimal256 {
+        scale: u8,
+    },
 
     // Nullable wrapper
     Nullable(Box<ClickHouseType>),
@@ -98,7 +112,10 @@ pub enum ClickHouseType {
     LowCardinality(Box<ClickHouseType>),
 
     // Map type
-    Map { key: Box<ClickHouseType>, value: Box<ClickHouseType> },
+    Map {
+        key: Box<ClickHouseType>,
+        value: Box<ClickHouseType>,
+    },
 
     // Tuple type
     Tuple(Vec<ClickHouseType>),
@@ -121,7 +138,9 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Nullable(Box::new(Self::parse(inner)?)));
         }
         if let Some(inner) = strip_wrapper(type_str, "LowCardinality") {
-            return Ok(ClickHouseType::LowCardinality(Box::new(Self::parse(inner)?)));
+            return Ok(ClickHouseType::LowCardinality(Box::new(Self::parse(
+                inner,
+            )?)));
         }
         if let Some(inner) = strip_wrapper(type_str, "Array") {
             return Ok(ClickHouseType::Array(Box::new(Self::parse(inner)?)));
@@ -131,7 +150,9 @@ impl ClickHouseType {
         if let Some(inner) = strip_wrapper(type_str, "Map") {
             let args = split_type_args(inner, type_str)?;
             if args.len() != 2 {
-                return Err(TypeParseError::InvalidSpec { spec: type_str.to_string() });
+                return Err(TypeParseError::InvalidSpec {
+                    spec: type_str.to_string(),
+                });
             }
             return Ok(ClickHouseType::Map {
                 key: Box::new(Self::parse(args[0])?),
@@ -157,12 +178,20 @@ impl ClickHouseType {
         // Handle DateTime64
         if let Some(inner) = strip_wrapper(type_str, "DateTime64") {
             let args = split_type_args(inner, type_str)?;
-            let precision = args.first()
-                .ok_or_else(|| TypeParseError::InvalidSpec { spec: type_str.to_string() })?
+            let precision = args
+                .first()
+                .ok_or_else(|| TypeParseError::InvalidSpec {
+                    spec: type_str.to_string(),
+                })?
                 .parse()
-                .map_err(|_| TypeParseError::InvalidSpec { spec: type_str.to_string() })?;
+                .map_err(|_| TypeParseError::InvalidSpec {
+                    spec: type_str.to_string(),
+                })?;
             let timezone = args.get(1).map(|s| s.trim_matches('\'').to_string());
-            return Ok(ClickHouseType::DateTime64 { precision, timezone });
+            return Ok(ClickHouseType::DateTime64 {
+                precision,
+                timezone,
+            });
         }
 
         // Handle DateTime with timezone (treat as basic DateTime)
@@ -174,23 +203,44 @@ impl ClickHouseType {
         if let Some(inner) = strip_wrapper(type_str, "Decimal") {
             let args = split_type_args(inner, type_str)?;
             if args.len() != 2 {
-                return Err(TypeParseError::InvalidSpec { spec: type_str.to_string() });
+                return Err(TypeParseError::InvalidSpec {
+                    spec: type_str.to_string(),
+                });
             }
-            let precision = args[0].parse().map_err(|_| TypeParseError::InvalidSpec { spec: type_str.to_string() })?;
-            let scale = args[1].parse().map_err(|_| TypeParseError::InvalidSpec { spec: type_str.to_string() })?;
+            let precision = args[0].parse().map_err(|_| TypeParseError::InvalidSpec {
+                spec: type_str.to_string(),
+            })?;
+            let scale = args[1].parse().map_err(|_| TypeParseError::InvalidSpec {
+                spec: type_str.to_string(),
+            })?;
             return Ok(ClickHouseType::Decimal { precision, scale });
         }
 
         for (prefix, ctor) in [
-            ("Decimal32", ClickHouseType::decimal32 as fn(u8) -> ClickHouseType),
-            ("Decimal64", ClickHouseType::decimal64 as fn(u8) -> ClickHouseType),
-            ("Decimal128", ClickHouseType::decimal128 as fn(u8) -> ClickHouseType),
-            ("Decimal256", ClickHouseType::decimal256 as fn(u8) -> ClickHouseType),
+            (
+                "Decimal32",
+                ClickHouseType::decimal32 as fn(u8) -> ClickHouseType,
+            ),
+            (
+                "Decimal64",
+                ClickHouseType::decimal64 as fn(u8) -> ClickHouseType,
+            ),
+            (
+                "Decimal128",
+                ClickHouseType::decimal128 as fn(u8) -> ClickHouseType,
+            ),
+            (
+                "Decimal256",
+                ClickHouseType::decimal256 as fn(u8) -> ClickHouseType,
+            ),
         ] {
             if let Some(scale_str) = strip_wrapper(type_str, prefix) {
-                let scale = scale_str.trim().parse().map_err(|_| TypeParseError::InvalidSpec {
-                    spec: type_str.to_string(),
-                })?;
+                let scale = scale_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| TypeParseError::InvalidSpec {
+                        spec: type_str.to_string(),
+                    })?;
                 return Ok(ctor(scale));
             }
         }
@@ -200,7 +250,9 @@ impl ClickHouseType {
             return Ok(ClickHouseType::Enum8(parse_enum_variants(inner, type_str)?));
         }
         if let Some(inner) = strip_wrapper(type_str, "Enum16") {
-            return Ok(ClickHouseType::Enum16(parse_enum_variants(inner, type_str)?));
+            return Ok(ClickHouseType::Enum16(parse_enum_variants(
+                inner, type_str,
+            )?));
         }
 
         // Simple types
@@ -228,12 +280,14 @@ impl ClickHouseType {
             "IPv4" => Ok(ClickHouseType::IPv4),
             "IPv6" => Ok(ClickHouseType::IPv6),
             "JSON" | "Object('json')" => Ok(ClickHouseType::JSON),
-            _ => Err(TypeParseError::UnsupportedType { type_name: type_str.to_string() }),
+            _ => Err(TypeParseError::UnsupportedType {
+                type_name: type_str.to_string(),
+            }),
         }
     }
 
     /// Returns true if this type is nullable.
-    pub fn is_nullable(&self) -> bool {
+    pub const fn is_nullable(&self) -> bool {
         matches!(self, ClickHouseType::Nullable(_))
     }
 
@@ -252,10 +306,18 @@ impl ClickHouseType {
 
 // Helper function constructors for Decimal variants (needed for the loop above)
 impl ClickHouseType {
-    fn decimal32(scale: u8) -> Self { ClickHouseType::Decimal32 { scale } }
-    fn decimal64(scale: u8) -> Self { ClickHouseType::Decimal64 { scale } }
-    fn decimal128(scale: u8) -> Self { ClickHouseType::Decimal128 { scale } }
-    fn decimal256(scale: u8) -> Self { ClickHouseType::Decimal256 { scale } }
+    const fn decimal32(scale: u8) -> Self {
+        ClickHouseType::Decimal32 { scale }
+    }
+    const fn decimal64(scale: u8) -> Self {
+        ClickHouseType::Decimal64 { scale }
+    }
+    const fn decimal128(scale: u8) -> Self {
+        ClickHouseType::Decimal128 { scale }
+    }
+    const fn decimal256(scale: u8) -> Self {
+        ClickHouseType::Decimal256 { scale }
+    }
 }
 
 /// Strips a wrapper type from a type string.
@@ -281,7 +343,9 @@ pub fn extract_type_name(input: &str) -> (&str, &str) {
 pub fn parse_type_args(input: &str) -> Result<Vec<&str>, TypeParseError> {
     let trimmed = input.trim();
     if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-        return Err(TypeParseError::MalformedArguments { input: input.to_string() });
+        return Err(TypeParseError::MalformedArguments {
+            input: input.to_string(),
+        });
     }
     let inner = &trimmed[1..trimmed.len() - 1];
     if inner.trim().is_empty() {
@@ -341,7 +405,10 @@ fn split_type_args<'a>(inner: &'a str, type_str: &str) -> Result<Vec<&'a str>, T
     })
 }
 
-fn parse_enum_variants<T: std::str::FromStr>(inner: &str, type_str: &str) -> Result<Vec<(String, T)>, TypeParseError>
+fn parse_enum_variants<T: std::str::FromStr>(
+    inner: &str,
+    type_str: &str,
+) -> Result<Vec<(String, T)>, TypeParseError>
 where
     T::Err: std::fmt::Debug,
 {
@@ -351,9 +418,12 @@ where
             spec: type_str.to_string(),
         })?;
         let name = part[..eq_pos].trim().trim_matches('\'').to_string();
-        let value = part[eq_pos + 1..].trim().parse().map_err(|_| TypeParseError::InvalidSpec {
-            spec: type_str.to_string(),
-        })?;
+        let value = part[eq_pos + 1..]
+            .trim()
+            .parse()
+            .map_err(|_| TypeParseError::InvalidSpec {
+                spec: type_str.to_string(),
+            })?;
         variants.push((name, value));
     }
     Ok(variants)
@@ -365,8 +435,14 @@ mod tests {
 
     #[test]
     fn test_strip_wrapper() {
-        assert_eq!(strip_wrapper("Nullable(String)", "Nullable"), Some("String"));
-        assert_eq!(strip_wrapper("LowCardinality(String)", "LowCardinality"), Some("String"));
+        assert_eq!(
+            strip_wrapper("Nullable(String)", "Nullable"),
+            Some("String")
+        );
+        assert_eq!(
+            strip_wrapper("LowCardinality(String)", "LowCardinality"),
+            Some("String")
+        );
         assert_eq!(strip_wrapper("String", "Nullable"), None);
     }
 
@@ -386,13 +462,22 @@ mod tests {
     fn test_unwrap_modifiers() {
         assert_eq!(unwrap_modifiers("String"), ("String", false));
         assert_eq!(unwrap_modifiers("Nullable(String)"), ("String", true));
-        assert_eq!(unwrap_modifiers("LowCardinality(Nullable(String))"), ("String", true));
+        assert_eq!(
+            unwrap_modifiers("LowCardinality(Nullable(String))"),
+            ("String", true)
+        );
     }
 
     #[test]
     fn test_parse_simple_types() {
-        assert_eq!(ClickHouseType::parse("Int64").unwrap(), ClickHouseType::Int64);
-        assert_eq!(ClickHouseType::parse("String").unwrap(), ClickHouseType::String);
+        assert_eq!(
+            ClickHouseType::parse("Int64").unwrap(),
+            ClickHouseType::Int64
+        );
+        assert_eq!(
+            ClickHouseType::parse("String").unwrap(),
+            ClickHouseType::String
+        );
         assert_eq!(ClickHouseType::parse("Bool").unwrap(), ClickHouseType::Bool);
     }
 
@@ -415,7 +500,10 @@ mod tests {
     #[test]
     fn test_parse_datetime64() {
         match ClickHouseType::parse("DateTime64(3)").unwrap() {
-            ClickHouseType::DateTime64 { precision, timezone } => {
+            ClickHouseType::DateTime64 {
+                precision,
+                timezone,
+            } => {
                 assert_eq!(precision, 3);
                 assert_eq!(timezone, None);
             }
